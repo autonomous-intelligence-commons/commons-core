@@ -1,0 +1,25 @@
+# .dockerignore — keeps the image minimal and keeps SECRETS OUT of image layers.
+# (spec §23 Docker: "Do not embed secrets in image layers"; .env is excluded!)
+.venv
+.env
+.env.local
+data
+tests
+docs
+.github
+.git
+.gitignore
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+dist
+build
+*.db
+*.sqlite3
+*.key
+compose.yaml
+Dockerfile
+.dockerignore

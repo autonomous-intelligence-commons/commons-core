@@ -1,0 +1,89 @@
+# AIC Phase 1 local Docker Compose topology — PREPARED, NEVER RUN in the
+# Phase 1 sandbox (Docker unavailable; see docs/DEPLOYMENT.md §9, docs/TESTING.md §5).
+#
+# Services:
+#   postgres — PostgreSQL 16 (health-checked, private to the compose network)
+#   migrate  — one-shot `alembic upgrade head` (must complete before api/worker)
+#   api      — uvicorn (the ONLY host-published port)
+#   worker   — scripts/run_worker.py --loop (no host port)
+#
+# Required in .env (or exported) before `docker compose up --build`:
+#   AIC_MASTER_KEYS     kid:hex, hex = `python -c "import secrets; print(secrets.token_hex(32))"`
+#                       (the all-zeros example value in .env.example is REJECTED
+#                       by the key store at startup — by design)
+# Optional overrides: POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB,
+#   AIC_API_PORT (default 8010), AIC_ACTIVE_KEY_ID (default k1).
+#
+# NOTE: the worker deliberately does NOT receive AIC_MASTER_KEYS — it never
+# decrypts content (deterministic handlers, non-sensitive payloads); least
+# privilege per spec §8/§17.
+
+name: commons-core
+
+x-app-database: &app-database
+  AIC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-commons}:${POSTGRES_PASSWORD:-commons-dev}:${POSTGRES_DB:-commons}@postgres:5432/${POSTGRES_DB:-commons}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-commons}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-commons-dev}
+      POSTGRES_DB: ${POSTGRES_DB:-commons}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-commons} -d ${POSTGRES_DB:-commons}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  migrate:
+    build: .
+    command: alembic upgrade head
+    environment:
+      <<: *app-database
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # one-shot job: the image HEALTHCHECK probes the API server, which this
+    # job does not run — disable it to avoid a misleading 'unhealthy' state.
+    healthcheck:
+      disable: true
+    restart: "no"
+
+  api:
+    build: .
+    command: sh -c "uvicorn commons_core.api.app:app --host 0.0.0.0 --port ${AIC_API_PORT:-8010}"
+    ports:
+      - "${AIC_API_PORT:-8010}:${AIC_API_PORT:-8010}"
+    environment:
+      <<: *app-database
+      AIC_MASTER_KEYS: '${AIC_MASTER_KEYS:?set AIC_MASTER_KEYS in .env — generate with: python -c "import secrets; print(secrets.token_hex(32))"}'
+      AIC_ACTIVE_KEY_ID: ${AIC_ACTIVE_KEY_ID:-k1}
+      AIC_ENV: ${AIC_ENV:-development}
+      AIC_API_PORT: ${AIC_API_PORT:-8010}
+      # PORT lets the image HEALTHCHECK target the same port the command binds.
+      PORT: ${AIC_API_PORT:-8010}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: python scripts/run_worker.py --loop
+    environment:
+      <<: *app-database
+      AIC_ENV: ${AIC_ENV:-development}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # the worker serves no HTTP — disable the image's API healthcheck.
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
+volumes:
+  pgdata:

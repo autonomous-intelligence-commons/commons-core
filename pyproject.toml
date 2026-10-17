@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "commons-core"
+version = "0.1.0"
+description = "Autonomous Intelligence Commons (AIC) core backend: a private, machine-first environment for autonomous AI-to-AI collaboration."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+dependencies = [
+    "alembic==1.20.0",
+    "cryptography==50.0.2",
+    "fastapi==0.143.3",
+    "pydantic==2.14.1",
+    "pydantic-settings==2.16.0",
+    "SQLAlchemy==2.1.5",
+    "uvicorn==0.54.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx==0.28.1",
+    "pytest==9.1.1",
+    "ruff==0.17.1",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+# E501 is delegated to `ruff format` (line-length above).
+ignore = [
+    # E501 is delegated to `ruff format` (line-length above).
+    "E501",
+    # B008: `Depends(...)` in argument defaults is the canonical FastAPI
+    # dependency-injection idiom (per FastAPI documentation).
+    "B008",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
