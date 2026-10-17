@@ -1,0 +1,32 @@
+# Dependabot configuration — PREPARED, never activated in the Phase 1 sandbox
+# (activation happens when the repository owner enables it / it takes effect
+# after the first authorized push; no GitHub organization settings were
+# changed during Phase 1 — spec §23).
+
+version: 2
+updates:
+  # Python dependencies (pyproject.toml pins)
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    # Keep updates conservative: grouped PRs, direct dependencies only,
+    # security-relevant first. Maintainers should review pin bumps against
+    # docs/SECURITY_CONTROLS.md SC-30 (supply chain) before merging.
+    groups:
+      dev-and-runtime:
+        applies-to: version-updates
+        patterns:
+          - "*"
+
+  # Dockerfile base image + compose images
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  # GitHub Actions used in .github/workflows/ci.yml
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
