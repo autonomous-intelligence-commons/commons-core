@@ -1,0 +1,126 @@
+# AIC Phase 1 continuous integration — PREPARED, NEVER EXECUTED.
+# Docker/GitHub Actions were unavailable in the Phase 1 sandbox; this
+# workflow has never run. First run happens after an authorized push.
+# See docs/TESTING.md §5 (untested areas).
+#
+# Spec §30 requirements covered:
+#   lint            — formatting + linting (ruff, pinned to project version)
+#   test            — unit + integration + security + privacy + recovery (pytest)
+#   migrate-check   — alembic upgrade/downgrade/upgrade round-trip (SQLite)
+#   dependency-audit— pip-audit (NON-BLOCKING by design; see its comment)
+# Static analysis beyond ruff is covered by ruff's rule set (E,F,W,I,UP,B).
+#
+# Security posture (spec §23 GitHub Actions):
+#   - least-privilege permissions (contents: read, nothing else)
+#   - NO secrets are used or required by CI (synthetic fixtures only)
+#   - actions/checkout pinned by commit SHA; other actions tracked via tags
+#     (TODO for maintainers: pin setup-python/upload-artifact to commit SHAs
+#     after their first verified run — Dependabot will propose updates)
+#   - NO deploy job: Railway deployment requires SEPARATE authorization
+#     (spec §31); CI must never auto-deploy.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & format check (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
+        with:
+          python-version: "3.12"
+      - name: Install ruff (project pin)
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.17.1
+      - name: Ruff lint
+        run: ruff check .
+      - name: Ruff format check
+        run: ruff format --check .
+
+  test:
+    name: Tests (pytest — functional, security, privacy, recovery)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
+        with:
+          python-version: "3.12"
+      - name: Install application + dev dependencies (pinned)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Run the deterministic test suite (no network, no real AI)
+        run: python -m pytest -q --junitxml=pytest-results.xml
+      - name: Upload test results
+        if: always() # upload even when tests fail, for triage
+        uses: actions/upload-artifact@v4 # TODO: pin to commit SHA after first verified run
+        with:
+          name: pytest-results
+          path: pytest-results.xml
+          if-no-files-found: error
+
+  migrate-check:
+    name: Alembic migration round-trip (SQLite)
+    runs-on: ubuntu-latest
+    env:
+      AIC_DATABASE_URL: "sqlite+pysqlite:////tmp/migrate-check.db"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
+        with:
+          python-version: "3.12"
+      - name: Install application (pinned)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+      - name: Apply all migrations
+        run: alembic upgrade head
+      - name: Roll back to base
+        run: alembic downgrade base
+      - name: Re-apply all migrations
+        run: alembic upgrade head
+
+  dependency-audit:
+    name: Dependency vulnerability audit (pip-audit)
+    runs-on: ubuntu-latest
+    # NON-BLOCKING by design: pip-audit may report advisories in transitive
+    # dependencies or OS-level packages that do not affect this threat model;
+    # blocking CI on untriageable noise would stop development. Advisories
+    # must be triaged via the (blocking) review process and Dependabot alerts.
+    # Honest limitation: this job has never executed in Phase 1.
+    continue-on-error: true
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
+        with:
+          python-version: "3.12"
+      - name: Install application + pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pip-audit==2.10.1
+      - name: Audit the installed environment
+        run: pip-audit --strict
+
+  # NO DEPLOY JOB — DELIBERATE.
+  # Spec §31: "Do not deploy to Railway. All deployment actions require
+  # separate user authorization after Phase 1." Railway deployment must be
+  # performed manually per docs/DEPLOYMENT.md once authorized.
