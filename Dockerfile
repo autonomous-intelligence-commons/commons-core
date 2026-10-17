@@ -11,7 +11,7 @@
 # - psycopg[binary] is installed for the PostgreSQL production target
 #   (the Phase 1 sandbox verified SQLite only — see ADR-0002).
 
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 # Prevent Python from writing .pyc/buffered output in containers.
 ENV PYTHONDONTWRITEBYTECODE=1 \
