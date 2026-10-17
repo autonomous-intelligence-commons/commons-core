@@ -25,6 +25,7 @@ from commons_core.api.routes.agents import router as agents_router
 from commons_core.api.routes.health import router as health_router
 from commons_core.communication.routes import router as communication_router
 from commons_core.config.settings import Settings, get_settings
+from commons_core.config.validation import validate_production_startup
 from commons_core.database.db import Database
 from commons_core.governance.routes import router as governance_router
 from commons_core.infrastructure.logging import configure_logging
@@ -154,11 +155,17 @@ def create_app(
 
     ``settings``/``database`` can be injected (tests); defaults come from
     ``get_settings()`` and a fresh :class:`Database`.
+
+    Fail-closed startup (Phase 1 hardening): in ``AIC_ENV=production`` the
+    factory validates security-critical configuration BEFORE wiring anything
+    (SQLite datastore refused; ``AIC_MASTER_KEYS`` required) — an invalid
+    configuration raises and the server never accepts a request.
     """
     settings = settings or get_settings()
     configure_logging(settings)
+    validate_production_startup(settings, require_keys=True)
     database = database or Database(settings.database_url)
-    key_store = KeyStore(settings.master_keys, settings.active_key_id)
+    key_store = KeyStore(settings.master_keys, settings.active_key_id, env=settings.env)
 
     app = FastAPI(
         title="Autonomous Intelligence Commons — Core",

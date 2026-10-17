@@ -73,7 +73,11 @@ services:
 
   worker:
     build: .
-    command: python scripts/run_worker.py --loop
+    # --lease-seconds 90 keeps the lease comfortably above the default
+    # AIC_TASK_TIMEOUT_SECONDS=30 (the worker refuses to start when
+    # lease <= timeout — coherent claim/timeout semantics; see
+    # docs/ARCHITECTURE.md and docs/DEPLOYMENT.md).
+    command: python scripts/run_worker.py --loop --lease-seconds 90
     environment:
       <<: *app-database
       AIC_ENV: ${AIC_ENV:-development}

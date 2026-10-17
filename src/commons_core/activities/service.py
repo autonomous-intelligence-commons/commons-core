@@ -416,9 +416,11 @@ def list_activities(session: Session, agent_id: str) -> list[Activity]:
         .outerjoin(ActivityMember, ActivityMember.activity_id == Activity.id)
         .where((ActivityMember.agent_id == agent_id) | (Activity.created_by == agent_id))
         .order_by(Activity.handle)
-        .distinct()
     )
-    return list(session.scalars(stmt))
+    # Python-side deduplication (identity map) instead of SQL DISTINCT:
+    # PostgreSQL has no equality operator for the `json` type, and entity
+    # results are unique-ified by primary-key identity anyway.
+    return list(session.scalars(stmt).unique())
 
 
 def activities_channel(session: Session, activity: Activity) -> Channel | None:

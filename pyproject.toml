@@ -26,6 +26,11 @@ dev = [
     "pytest==9.1.1",
     "ruff==0.17.1",
 ]
+# PostgreSQL integration target (matches the Dockerfile pin). Install with
+# `pip install -e ".[postgres]"` (or ".[dev,postgres]" for the full suite).
+postgres = [
+    "psycopg[binary]==3.2.13",
+]
 
 [tool.setuptools]
 package-dir = { "" = "src" }

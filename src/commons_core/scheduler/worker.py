@@ -14,11 +14,20 @@
 3. ``claim_next`` — lease the oldest eligible pending task (committed
    before execution: a crash mid-execution lets the lease expire and the
    task retry — AT-LEAST-ONCE execution, no exactly-once claim).
-4. ``execute_claimed`` — dispatch to the deterministic registered handler.
+4. ``execute_claimed`` — dispatch to the deterministic registered handler,
+   bounded by ``task_timeout_seconds`` of wall-clock time when > 0 (Phase 1
+   hardening: the handler runs on a guard-wrapped thread; a timeout is a
+   normal failure → retry/backoff; an abandoned handler thread can never
+   touch the session again — see scheduler.service for the honest limits).
 
 The scheduler OFFERS execution opportunities only: handlers are
 deterministic, message-free and never require agents to produce messages
 (spec §16 — future AI decision-making remains independent of scheduling).
+
+Lease/timeout coherence: when ``task_timeout_seconds > 0`` the worker
+REFUSES to start unless ``lease_seconds > task_timeout_seconds`` — a
+stuck-but-revoked handler must not outlive its lease and risk a second
+concurrent claim of the same task.
 
 Graceful shutdown: SIGTERM/SIGINT (main thread, loop mode) set a stop flag;
 the loop checks the flag only BETWEEN iterations, so an in-flight task
@@ -92,6 +101,7 @@ def run_worker(
     max_tasks: int = 100,
     lease_seconds: int = 30,
     idle_sleep: float = 0.05,
+    task_timeout_seconds: float = 0.0,
     clock: Clock | None = None,
     stop_event: threading.Event | None = None,
 ) -> int:
@@ -101,9 +111,22 @@ def run_worker(
     context (``Database.session``). ``clock`` defaults to real UTC time and
     is injectable for deterministic tests. ``once=True`` processes at most
     ONE task and exits (also cleanly under an active emergency stop).
+
+    ``task_timeout_seconds`` (from ``AIC_TASK_TIMEOUT_SECONDS``): when > 0,
+    each handler execution gets that wall-clock budget (guarded thread;
+    timeout → retry/backoff). The worker refuses to start unless
+    ``lease_seconds > task_timeout_seconds`` (coherent claim/timeout
+    semantics — see the module docstring).
     """
     if max_tasks < 1:
         raise ValueError("max_tasks must be >= 1")
+    if task_timeout_seconds > 0 and lease_seconds <= task_timeout_seconds:
+        raise ValueError(
+            "lease_seconds must EXCEED task_timeout_seconds "
+            f"(lease_seconds={lease_seconds}, task_timeout_seconds={task_timeout_seconds}): "
+            "a stuck-but-revoked handler must not outlive its lease, or a second "
+            "worker could claim the same task while the abandoned thread lingers."
+        )
     clock = clock or utc_now
     owned_stop_event: threading.Event | None = stop_event
     if owned_stop_event is None and not once:
@@ -152,7 +175,9 @@ def run_worker(
         with session_factory() as session:
             task = service.get_task(session, claimed_id)
             if task is not None and task.status == service.TaskStatus.LEASED:
-                service.execute_claimed(session, task, as_utc(clock()))
+                service.execute_claimed(
+                    session, task, as_utc(clock()), timeout_seconds=task_timeout_seconds
+                )
 
         processed += 1
         if once or processed >= max_tasks:

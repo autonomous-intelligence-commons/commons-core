@@ -100,3 +100,67 @@ Suite = 344 collected (342 passed + 2 skipped). Categories map to spec §29.
 
 **No fabricated coverage numbers or guarantees:** every number above comes
 from the run in §2 executed in this environment.
+
+## 6. PostgreSQL integration (Phase 1 hardening — EXECUTED)
+
+The full suite runs unchanged against a real PostgreSQL server via
+`AIC_TEST_DATABASE_URL` (per-test schema isolation: `drop_all` →
+`create_all` on the shared test database):
+
+```bash
+pip install -e ".[dev,postgres]"   # psycopg[binary]==3.2.13 (Dockerfile pin)
+AIC_TEST_DATABASE_URL=postgresql+psycopg://user:pass@localhost:5432/commons \
+    python -m pytest -q
+```
+
+Fail-loud guarantees (`tests/conftest.py::_backend_guard`, session-scoped):
+a `sqlite` value in `AIC_TEST_DATABASE_URL` aborts the session; an
+unreachable/invalid URL aborts with the driver error; the live dialect is
+asserted to be PostgreSQL. There is NO silent SQLite fallback.
+
+**Results executed locally against PostgreSQL 16.2** (embedded server via
+the pgserver binaries; psycopg 3.2.13):
+
+- `python -m pytest -q` → **382 passed, 2 skipped** (the documented
+  identity-matrix skips), 1 cosmetic warning (fastapi TestClient
+  deprecation — same as on SQLite).
+- SQLite suite (same revision): **374 passed, 10 skipped** (8
+  PostgreSQL-only tests skip without `AIC_TEST_DATABASE_URL`).
+- Alembic on PostgreSQL: `upgrade head` → schema inspection (17 tables
+  incl. `alembic_version`; JSON columns; `timestamptz`; BIGINT
+  `security_events.id`; unique index `ix_scheduled_tasks_idempotency_key`)
+  → `downgrade base` → `upgrade head`. Round-trip verified.
+- Durable-scheduler concurrency on PostgreSQL: the multi-worker recovery
+  tests run against PostgreSQL (recovery fixtures are backend-aware);
+  `claim_next` emits `FOR UPDATE SKIP LOCKED` (proven by
+  `tests/integration/test_postgres_schema.py::
+  TestPostgreSQLSchedulerClaim::test_claim_emits_for_update_skip_locked`).
+- Live E2E on production PostgreSQL (`AIC_ENV=production`, real key,
+  alembic-migrated DB): health 200 → CLI provisioning → channel →
+  AES-256-GCM encrypted message → cross-agent retrieve + decrypt → admin
+  non-member read 403 → telemetry counts-only → task submit →
+  `run_worker.py --once` → `succeeded`.
+- Fail-closed startup matrix (live subprocesses, 8/8 pass): production
+  without keys REFUSED; with valid keys STARTED; with SQLite REFUSED;
+  placeholder key REFUSED; unknown active kid REFUSED; development without
+  keys STARTED (ephemeral); typo `AIC_ENV` REFUSED; worker with
+  production+SQLite REFUSED.
+
+New/changed test files (this hardening pass):
+
+| File | Proves |
+| --- | --- |
+| `tests/integration/test_postgres_schema.py` (PG-only) | 16 tables; VARCHAR enums (no native PG ENUM); timestamptz; JSON; BIGINT id; unique constraints+indexes; FKs; `FOR UPDATE SKIP LOCKED` |
+| `tests/security/test_production_key_management.py` (24) | fail-closed matrix; env normalization; ephemeral fallback only in dev/test; rotation (retained-kid decryptability, removal → typed `UnknownKeyError`, active-kid sealing); key material never in logs |
+| `tests/operational/test_task_timeout.py` (10) | completes-within-budget; exceeds-budget → retry/backoff; exhausted retries → terminal `failed`; abandoned handler cannot use the session (guard raises `TaskExecutionRevokedError`); payload content never in `last_error`; legacy inline mode; lease/timeout coherence; worker E2E; concurrent workers; emergency stop |
+| `tests/conftest.py` + `tests/recovery/*` | backend selection + backend-aware recovery (the multi-worker tests now execute on PostgreSQL) |
+
+## 7. Honest scope of the hardening verification
+
+- The `docker` and `postgres` CI jobs in `.github/workflows/ci.yml` were
+  authored for GitHub Actions. The `postgres` job replicates locally what
+  was executed above; the `docker` job (image build, non-root check,
+  compose stack, smoke test) could NOT be executed in this environment —
+  no Docker runtime exists in the sandbox. It will execute on GitHub
+  Actions after the branch is pushed; its first real results will appear
+  on the pull request.

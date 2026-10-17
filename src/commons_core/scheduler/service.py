@@ -2,21 +2,40 @@
 
 Durable task queue semantics — HONEST guarantees:
 - **At-least-once execution.** A task is claimed by exactly one worker at a
-  time (conditional ``UPDATE ... WHERE status='pending'`` + rowcount check;
-  SQLite-safe short transactions instead of ``SELECT ... FOR UPDATE`` —
-  PostgreSQL deployments can upgrade the claim to a locking UPDATE), but a
-  worker crash after claim and before completion makes the task eligible
-  AGAIN once its lease expires. **No exactly-once claim is made** (spec
-  §16/§22 "protection against duplicate processing" is best-effort).
+  time (conditional ``UPDATE ... WHERE status='pending'`` + rowcount check).
+  On PostgreSQL the candidate scan additionally takes
+  ``FOR UPDATE SKIP LOCKED`` so concurrent workers never block on each
+  other's in-flight claims (short transactions; row locks released at
+  commit). A worker crash after claim and before completion makes the task
+  eligible AGAIN once its lease expires. **No exactly-once claim is made**
+  (spec §16/§22 "protection against duplicate processing" is best-effort).
 - **Retry limits.** ``attempts`` is incremented AT CLAIM TIME (claiming
   counts as an attempt). A failing handler with ``attempts >= max_attempts``
   transitions to the terminal ``failed`` state; otherwise the task returns
   to ``pending`` with ``run_at = now + backoff(attempts)`` (exponential
   ``2^attempts`` seconds, capped at 60) — infinite retries are impossible.
+- **Execution timeouts** (Phase 1 hardening, Task 4). When
+  ``timeout_seconds > 0`` the handler runs on a guard-wrapped worker thread
+  and is given at most ``timeout_seconds`` of wall-clock time. A timeout is
+  treated as a normal handler failure (retry/backoff policy, ``last_error``
+  records only the exception class + "task execution exceeded Ns" — never
+  payload content). HONEST LIMIT (documented in docs/ARCHITECTURE.md):
+  Python cannot forcibly terminate arbitrary running code — after a timeout
+  the abandoned thread stays alive until its next session call, which the
+  execution guard turns into an immediate :class:`TaskExecutionRevokedError`;
+  a handler stuck in a non-session C call (sleep/network) cannot be killed
+  in-process and must be handled by lease expiry + process restart. Future
+  AI execution requires independently cancellable execution environments.
+  The database is protected regardless: the guard serializes session access
+  so an abandoned handler can never commit or corrupt state after the main
+  thread has applied the timeout failure.
 - **Leases.** ``claim_next`` sets ``lease_expires_at = now + lease``.
   ``expire_leases`` returns expired leases to ``pending`` WITHOUT counting
   a new attempt (the attempt was already counted at claim); a task whose
-  attempts are exhausted fails as lease-expired.
+  attempts are exhausted fails as lease-expired. Coherence rule (enforced
+  by ``run_worker``): ``lease_seconds`` must EXCEED ``timeout_seconds`` so a
+  timed-out-but-stuck handler cannot outlive its lease and get claimed by a
+  second worker while still holding the guard.
 - **Idempotency.** ``idempotency_key`` is globally unique: re-submitting
   the same key RETURNS the existing task (no duplicate) when the owner
   matches; a different owner using the same key gets 409
@@ -44,6 +63,7 @@ only. Task payloads are echoed ONLY to the owning agent.
 """
 
 import json
+import threading
 import uuid as uuidlib
 from datetime import datetime, timedelta
 
@@ -140,6 +160,23 @@ class TaskAttemptsInvalidError(DomainError):
 
     def __init__(self, limit: int) -> None:
         super().__init__(f"max_attempts must be between 1 and {limit}.", limit=limit)
+
+
+class TaskTimeoutError(Exception):
+    """A task handler exceeded its execution-time budget (internal, worker-side).
+
+    Not a :class:`DomainError` — timeouts never surface over HTTP; they drive
+    the retry/backoff policy inside :func:`execute_claimed`.
+    """
+
+
+class TaskExecutionRevokedError(Exception):
+    """A timed-out (abandoned) handler tried to use the session after revocation.
+
+    Raised by :class:`_ExecutionGuard` — bounds the database side effects of
+    an abandoned handler thread so it can never commit or corrupt task state
+    after the timeout failure has been applied.
+    """
 
 
 class PayloadNestingTooDeepError(DomainError):
@@ -321,6 +358,106 @@ def create_task(
     return task, True
 
 
+class _ExecutionGuard:
+    """Revocable session proxy bounding an abandoned handler's DB effects.
+
+    Wraps the real :class:`Session` passed to a task handler. Every method
+    call first acquires ``_lock`` and checks ``_revoked``; after revocation
+    every call raises :class:`TaskExecutionRevokedError` BEFORE touching the
+    underlying session. :meth:`revoke` acquires the same lock, so the main
+    thread waits for any in-flight handler statement (bounded, single
+    statement) before setting the flag — after ``revoke()`` returns, no
+    handler call is executing or can start, making the main thread's
+    subsequent rollback + failure update race-free. Attribute access is
+    delegated via ``__getattr__``; non-callable attributes pass through.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+        self._revoked = threading.Event()
+        self._lock = threading.Lock()
+
+    def revoke(self) -> None:
+        """Forbid all further session use by the guarded handler."""
+        with self._lock:
+            self._revoked.set()
+
+    def __getattr__(self, name: str):
+        attribute = getattr(self._session, name)
+        if not callable(attribute):
+            return attribute
+
+        def _guarded(*args, **kwargs):
+            with self._lock:
+                if self._revoked.is_set():
+                    raise TaskExecutionRevokedError(
+                        "task execution was revoked after a timeout — "
+                        "the handler may no longer use the session"
+                    )
+                return attribute(*args, **kwargs)
+
+        return _guarded
+
+
+class _HandlerOutcome:
+    """Mutable holder for the handler thread's result (success or exception)."""
+
+    __slots__ = ("failure", "revoked")
+
+    def __init__(self) -> None:
+        self.failure: BaseException | None = None
+        self.revoked = False
+
+
+def _run_handler_on_thread(
+    handler,
+    session: Session,
+    task: ScheduledTask,
+    timeout_seconds: float,
+) -> _HandlerOutcome:
+    """Run ``handler`` on a guarded daemon thread with a wall-clock budget.
+
+    Returns the outcome holder once the thread finished OR the budget
+    elapsed (in which case the guard is revoked and the still-running thread
+    is abandoned — it dies on its next session call; see the honest-limit
+    note in the module docstring). ``timeout_seconds <= 0`` executes the
+    handler inline on the current thread (legacy path, no guard).
+    """
+    if timeout_seconds is None or timeout_seconds <= 0:
+        outcome = _HandlerOutcome()
+        try:
+            handler(session, task)  # type: ignore[arg-type]  (direct execution)
+        except Exception as exc:  # noqa: BLE001 — handler failures drive the retry policy
+            outcome.failure = exc
+        return outcome
+
+    guard = _ExecutionGuard(session)
+    outcome = _HandlerOutcome()
+
+    def _target() -> None:
+        try:
+            handler(guard, task)  # type: ignore[arg-type]  (guard proxies Session)
+        except TaskExecutionRevokedError:
+            outcome.revoked = True  # abandoned thread exiting — outcome ignored
+        except Exception as exc:  # noqa: BLE001 — handler failures drive the retry policy
+            if not guard._revoked.is_set():  # noqa: SLF001 — post-revocation noise is ignored
+                outcome.failure = exc
+
+    thread = threading.Thread(target=_target, name=f"task-handler-{task.id}", daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        # Timeout: forbid further session use, abandon the thread. The DB is
+        # safe — the guard turns any later handler call into an immediate
+        # error, and only the MAIN thread writes task state (below).
+        guard.revoke()
+        outcome.failure = TaskTimeoutError(
+            f"task execution exceeded {timeout_seconds}s (handler abandoned; "
+            "guard revoked its session access)"
+        )
+    return outcome
+
+
 def claim_next(
     session: Session,
     now: datetime,
@@ -331,21 +468,25 @@ def claim_next(
     Candidates: ``status='pending'`` AND ``run_at <= now``, ordered oldest
     first. Each candidate is claimed with a conditional
     ``UPDATE ... WHERE status='pending'``; a lost race (rowcount 0) moves to
-    the next candidate — SQLite-safe short-transaction semantics standing in
-    for ``SELECT ... FOR UPDATE``. Claiming increments ``attempts`` (it
-    counts as an attempt) and sets ``lease_expires_at``.
+    the next candidate. On PostgreSQL the candidate scan ALSO takes
+    ``FOR UPDATE SKIP LOCKED`` — concurrent workers skip rows another worker
+    is already claiming instead of blocking on its row lock (short
+    transactions keep lock hold times minimal). Claiming increments
+    ``attempts`` (it counts as an attempt) and sets ``lease_expires_at``.
     """
     now = as_utc(now)
     if lease_seconds < 1:
         raise ValueError("lease_seconds must be >= 1")
-    candidates = list(
-        session.scalars(
-            select(ScheduledTask)
-            .where(ScheduledTask.status == TaskStatus.PENDING, ScheduledTask.run_at <= now)
-            .order_by(ScheduledTask.run_at, ScheduledTask.created_at, ScheduledTask.id)
-            .limit(_CLAIM_CANDIDATES)
-        )
+    stmt = (
+        select(ScheduledTask)
+        .where(ScheduledTask.status == TaskStatus.PENDING, ScheduledTask.run_at <= now)
+        .order_by(ScheduledTask.run_at, ScheduledTask.created_at, ScheduledTask.id)
+        .limit(_CLAIM_CANDIDATES)
     )
+    bind = session.get_bind()
+    if bind is not None and bind.dialect.name == "postgresql":
+        stmt = stmt.with_for_update(skip_locked=True)
+    candidates = list(session.scalars(stmt))
     lease_until = now + timedelta(seconds=lease_seconds)
     for candidate in candidates:
         result = session.execute(
@@ -365,16 +506,26 @@ def claim_next(
     return None
 
 
-def execute_claimed(session: Session, task: ScheduledTask, now: datetime) -> ScheduledTask:
+def execute_claimed(
+    session: Session,
+    task: ScheduledTask,
+    now: datetime,
+    timeout_seconds: float = 0.0,
+) -> ScheduledTask:
     """Execute a leased task through its registered handler (spec §16).
 
     Marks the task ``running`` (informational, intra-transaction), dispatches
-    to the registry handler, then: success → ``succeeded`` (+``finished_at``);
-    failure → ``failed`` (terminal) when ``attempts >= max_attempts``, else
-    back to ``pending`` with ``run_at = now + backoff(attempts)``. On failure
-    the transaction is rolled back FIRST to discard any partial handler
-    writes, then the failure state is applied. ``last_error`` stores the
-    exception class + message, truncated to 200 chars — never payload data.
+    to the registry handler — with a wall-clock execution budget of
+    ``timeout_seconds`` when > 0 (guarded worker thread; see
+    :func:`_run_handler_on_thread`) — then: success → ``succeeded``
+    (+``finished_at``); failure (including timeout) → ``failed`` (terminal)
+    when ``attempts >= max_attempts``, else back to ``pending`` with
+    ``run_at = now + backoff(attempts)``. On failure the transaction is
+    rolled back FIRST to discard any partial handler writes, then the
+    failure state is applied — an abandoned (timed-out) handler thread can
+    never apply state afterwards because its session access is revoked.
+    ``last_error`` stores the exception class + message, truncated to 200
+    chars — never payload data.
     """
     now = as_utc(now)
     if task.status != TaskStatus.LEASED:
@@ -383,15 +534,18 @@ def execute_claimed(session: Session, task: ScheduledTask, now: datetime) -> Sch
     session.flush()
 
     handler = registry.get_handler(task.kind)
-    failure: BaseException | None = None
-    try:
-        if handler is None:
-            raise RuntimeError(f"no handler registered for kind {task.kind!r}")  # noqa: TRY301
-        handler(session, task)
-    except Exception as exc:  # noqa: BLE001 — handler failures drive the retry policy
-        failure = exc
+    if handler is None:
+        outcome = _HandlerOutcome()
+        outcome.failure = RuntimeError(f"no handler registered for kind {task.kind!r}")
+    else:
+        outcome = _run_handler_on_thread(handler, session, task, timeout_seconds)
+    failure = outcome.failure
+
+    if failure is not None:
         # Discard partial handler writes before applying the failure state.
         session.rollback()
+        session.expire(task)  # re-read authoritative claim state after rollback
+        task.status = TaskStatus.LEASED  # restored intra-transaction marker
 
     if failure is None:
         task.status = TaskStatus.SUCCEEDED

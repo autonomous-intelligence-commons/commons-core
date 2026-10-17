@@ -242,9 +242,10 @@ def namespaces_for_agent(session: Session, agent_id: str) -> list[MemoryNamespac
         .outerjoin(MemoryPermission, MemoryPermission.namespace_id == MemoryNamespace.id)
         .where((MemoryNamespace.created_by == agent_id) | (MemoryPermission.agent_id == agent_id))
         .order_by(MemoryNamespace.handle)
-        .distinct()
     )
-    return list(session.scalars(stmt))
+    # Python-side deduplication — SQL DISTINCT is impossible on PostgreSQL
+    # `json` columns (no equality operator); identity-map uniquing is exact.
+    return list(session.scalars(stmt).unique())
 
 
 def entry_aad(namespace_id: str, key: str) -> str:

@@ -5,11 +5,17 @@ into a ``kid -> 32-byte AES-256 key`` mapping. Every key must be exactly 32
 bytes. Duplicate kids, malformed hex, wrong lengths and degenerate all-zero
 keys are rejected with clear errors that never echo key material.
 
-When the configuration is empty an *ephemeral* in-memory key (kid
-``dev-ephemeral``) is generated and a loud warning is logged: this is a
-disposable development key and data encrypted with it is lost on restart
-(mirrors spec §10.3 "local testing may use automatically generated disposable
-development keys").
+Environment awareness (Phase 1 hardening, Task 3):
+- ``development``/``test`` with an EMPTY specification: an *ephemeral*
+  in-memory key (kid ``dev-ephemeral``) is generated with a loud warning —
+  disposable development keys only; data encrypted with it is unrecoverable
+  after restart (risk documented in docs/CRYPTOGRAPHY.md).
+- ``production`` with an EMPTY specification: :class:`KeyConfigurationError`
+  — the ephemeral fallback is FORBIDDEN (fail-closed) because encrypted
+  messages and shared memory would become permanently unreadable after a
+  process restart. Production also rejects an empty ``active_key_id`` and
+  additional placeholder key patterns (all-same-character and sequential
+  hex keys that look copied from documentation).
 
 PRIVACY RULE: key material is never logged, never persisted, and never
 included in exception messages.
@@ -26,10 +32,31 @@ _LOGGER = logging.getLogger(__name__)
 #: Key id used for the ephemeral development key.
 EPHEMERAL_KEY_ID = "dev-ephemeral"
 
+#: Environments in which the ephemeral dev-key fallback is permitted.
+_PERMITTED_EPHEMERAL_ENVS = frozenset({"development", "test"})
+
 _KEY_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]*$")
 _KEY_BYTES = 32  # AES-256
 _HEX_LEN = _KEY_BYTES * 2
+
+#: Placeholder key patterns that look copied from documentation/examples —
+#: rejected in PRODUCTION only (a disposable dev key is fine locally).
+_PLACEHOLDER_HEX_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("f" * _HEX_LEN, "all-f placeholder"),
+    ("0" * _HEX_LEN, "all-zero placeholder"),
+    ("deadbeef" * (_HEX_LEN // 8), "repeated 'deadbeef' placeholder"),
+    ("0123456789abcdef" * (_HEX_LEN // 16), "sequential-hex placeholder"),
+)
+
+
+def _is_placeholder_key(key: bytes) -> str | None:
+    """Return the placeholder description if ``key`` matches a known pattern."""
+    hex_value = key.hex()
+    return next(
+        (description for pattern, description in _PLACEHOLDER_HEX_PATTERNS if hex_value == pattern),
+        None,
+    )
 
 
 def parse_master_keys(spec: str) -> dict[str, bytes]:
@@ -79,14 +106,37 @@ class KeyStore:
     rotation: the active kid seals new envelopes, all known kids can open.
     """
 
-    def __init__(self, master_keys: str, active_key_id: str = "k1") -> None:
+    def __init__(
+        self, master_keys: str, active_key_id: str = "k1", *, env: str = "development"
+    ) -> None:
         """Build the store from a master-key spec.
 
         An empty spec triggers the ephemeral development-key path (with a loud
-        warning). A non-empty spec with an ``active_key_id`` not present in the
-        map raises :class:`KeyConfigurationError`.
+        warning) ONLY in development/test environments; in ``production`` it
+        raises :class:`KeyConfigurationError` (fail-closed — no silent
+        ephemeral fallback). A non-empty spec with an ``active_key_id`` not
+        present in the map also raises :class:`KeyConfigurationError`.
+        Production additionally rejects an empty ``active_key_id`` and
+        placeholder-pattern keys.
         """
+        env = (env or "development").strip().lower()
+        is_production = env == "production"
+
         if not master_keys.strip():
+            if is_production:
+                raise KeyConfigurationError(
+                    "AIC_MASTER_KEYS is required in production (AIC_ENV=production): "
+                    "the ephemeral development-key fallback is forbidden because "
+                    "encrypted data would be unrecoverable after restart. Provide "
+                    'durable key material, e.g. AIC_MASTER_KEYS="k1:<64 hex chars>" '
+                    '(generate with: python -c "import secrets; '
+                    'print(secrets.token_hex(32))").'
+                )
+            if env not in _PERMITTED_EPHEMERAL_ENVS:  # pragma: no cover - settings validates
+                raise KeyConfigurationError(
+                    f"unknown environment {env!r}; expected one of "
+                    "['development', 'production', 'test']"
+                )
             self._keys: dict[str, bytes] = {EPHEMERAL_KEY_ID: os.urandom(_KEY_BYTES)}
             self._active_kid = EPHEMERAL_KEY_ID
             _LOGGER.warning(
@@ -100,6 +150,21 @@ class KeyStore:
 
         self._keys = parse_master_keys(master_keys)
         active = active_key_id.strip()
+        if is_production and not active:
+            raise KeyConfigurationError(
+                "AIC_ACTIVE_KEY_ID is required in production (empty/whitespace is "
+                "rejected); it must name one of the configured key ids."
+            )
+        if is_production:
+            for kid, key in self._keys.items():
+                placeholder = _is_placeholder_key(key)
+                if placeholder is not None:
+                    raise KeyConfigurationError(
+                        f"master key {kid!r} looks like an unsafe placeholder "
+                        f"({placeholder}) — production requires real key material "
+                        '(generate with: python -c "import secrets; '
+                        'print(secrets.token_hex(32))").'
+                    )
         if active not in self._keys:
             raise KeyConfigurationError(
                 f"active key id {active!r} is not present in AIC_MASTER_KEYS "
