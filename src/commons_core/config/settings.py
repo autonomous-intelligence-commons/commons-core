@@ -43,6 +43,27 @@ class Settings(BaseSettings):
     # only SQLite is exercised in this sandbox.
     database_url: str = "sqlite+pysqlite:///./data/commons.db"
 
+    @field_validator("database_url")
+    @classmethod
+    def _normalize_database_url(cls, value: str) -> str:
+        """Normalize the database URL dialect prefix.
+
+        Platform-provided connection URLs (Railway ``${{Postgres.DATABASE_URL}}``,
+        Heroku-style ``DATABASE_URL``) use the bare ``postgresql://`` (or legacy
+        ``postgres://``) scheme, which SQLAlchemy maps to the psycopg2 dialect.
+        The production image ships ONLY psycopg 3 (``psycopg[binary]``) — a
+        bare scheme would fail at engine creation with ModuleNotFoundError.
+        Rewrite the bare scheme to the explicit psycopg 3 dialect; the rest of
+        the URL (including any percent-encoded userinfo) is preserved
+        byte-for-byte. Explicit dialect suffixes (``postgresql+psycopg://``,
+        ``postgresql+psycopg2://``) and SQLite URLs are never rewritten.
+        """
+        normalized = value.strip()
+        for bare in ("postgresql://", "postgres://"):
+            if normalized.startswith(bare):
+                return "postgresql+psycopg://" + normalized[len(bare) :]
+        return normalized
+
     # --- Cryptography (spec §10) -------------------------------------------
     # Format: "kid1:<64 hex chars>,kid2:<64 hex chars>". Empty -> ephemeral
     # in-memory dev key (data lost on restart).

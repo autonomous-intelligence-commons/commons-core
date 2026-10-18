@@ -15,7 +15,7 @@ disposable dev values only).
 
 | Variable | Required | Dev default | Production guidance |
 |---|---|---|---|
-| `AIC_DATABASE_URL` | yes | `sqlite+pysqlite:///./data/commons.db` | `postgresql+psycopg://user:pass@host:5432/commons` — use the Railway PostgreSQL private-network URL. Install `psycopg[binary]` alongside the pinned deps when adding the PostgreSQL driver (it is NOT in the Phase 1 pinned set because SQLite was the sandbox DB). |
+| `AIC_DATABASE_URL` | yes | `sqlite+pysqlite:///./data/commons.db` | `postgresql+psycopg://user:pass@host:5432/commons` — use the Railway PostgreSQL private-network URL. Bare platform schemes (`postgresql://` / `postgres://`, e.g. Railway's `${{Postgres.DATABASE_URL}}` reference) are normalized automatically at Settings load; percent-encoded userinfo is supported (see docs/RAILWAY.md). Install `psycopg[binary]` alongside the pinned deps when adding the PostgreSQL driver (it is NOT in the Phase 1 pinned set because SQLite was the sandbox DB). |
 | `AIC_MASTER_KEYS` | yes (prod) | `k1:<64 hex zeros>` (disposable!) | `kid:<hex>` pairs, comma-separated. Generate each key with `python -c "import secrets; print(secrets.token_hex(32))"`. **Never commit.** Empty value → ephemeral in-memory key (dev only; data lost on restart, loud warning). |
 | `AIC_ACTIVE_KEY_ID` | yes (prod) | `k1` | The `kid` that seals new envelopes. Must exist in `AIC_MASTER_KEYS` (startup fails otherwise). |
 | `AIC_API_HOST` / `AIC_API_PORT` | no | `127.0.0.1` / `8010` | On Railway use `0.0.0.0` and `$PORT` (Railway injects `PORT`; do NOT hardcode). |
@@ -243,3 +243,8 @@ Railway deployment has been performed.** Private-network reachability is
 NOT an authorization boundary (spec §18). Run `alembic upgrade head`
 (migrate step) before starting api/worker; see §7 of this document and
 compose.yaml for the service topology.
+
+The complete deployment-ready Railway configuration (service layout,
+reference-variable syntax, pre-deploy migration strategy, backup/key
+custody, cost plan, and step-by-step web-UI instructions) lives in
+**docs/RAILWAY.md** — prepared for review, NOT deployed.
