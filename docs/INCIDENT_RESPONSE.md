@@ -223,3 +223,35 @@ Closed (UTC):           <timestamp>
 
 Every remediation that can be covered by an automated test SHOULD get one
 (nobody has ever regretted a regression test for an incident).
+
+## 12. Key loss / removal incident (historical ciphertext undecryptable)
+
+- **Symptoms:** member retrieval of historical messages/memory fails with
+  `UNKNOWN_KEY` (400); the envelope's `kid` is not in the configured
+  `AIC_MASTER_KEYS`.
+- **Containment:** do NOT remove or shuffle remaining kids; confirm which
+  kid is missing (envelope `kid` vs configured ids — error messages never
+  echo key material). No data is corrupted — AES-256-GCM verification
+  simply cannot proceed without the key.
+- **Recovery:** restore the missing kid material from secure storage and
+  redeploy with it RETAINED alongside the active kid (`AIC_MASTER_KEYS=
+  "k1:<restored>,k2:<active>"`); verify decryption of historical data.
+- **If the key is compromised (not merely lost):** rotate per
+  docs/DEPLOYMENT.md §12 — new active kid, retain the old kid only as
+  long as needed for recovery, then remove it; treat all data encrypted
+  under the compromised kid as exposed.
+- **Trade-off (by design):** keys are required to decrypt backups. Losing
+  ALL copies of a kid makes its ciphertext unrecoverable — this is the
+  documented cost of not holding escrowed plaintext.
+
+## 13. Handler resource-exhaustion incidents (updated by hardening)
+
+Worker execution is now bounded by `AIC_TASK_TIMEOUT_SECONDS`: timed-out
+handlers follow retry/backoff and end terminally `failed` with
+`last_error` carrying only the exception class (never payload content —
+privacy preserved during investigation). If tasks repeatedly fail with
+`TaskTimeoutError`, treat it as a handler defect or environment
+degradation: inspect task `kind` and `attempts`, and remember an
+abandoned handler stuck in non-session code is bounded by lease expiry
+(90s in compose) and process restart — restart the worker if CPU/memory
+pressure persists.

@@ -15,7 +15,13 @@ Never read ``os.environ`` directly in domain modules.
 
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: Environments recognized by the application. ``production`` activates
+#: fail-closed startup validation (commons_core.config.validation);
+#: ``development``/``test`` permit the ephemeral dev-key fallback.
+KNOWN_ENVS = frozenset({"development", "test", "production"})
 
 
 class Settings(BaseSettings):
@@ -46,7 +52,18 @@ class Settings(BaseSettings):
     # --- API -----------------------------------------------------------------
     api_host: str = "127.0.0.1"
     api_port: int = 8010
+    # "development" | "test" | "production" — production enables fail-closed
+    # startup checks (keys required, SQLite refused; see config/validation.py).
     env: str = "development"
+
+    @field_validator("env")
+    @classmethod
+    def _normalize_env(cls, value: str) -> str:
+        """Normalize and validate the environment name (fail early on typos)."""
+        normalized = value.strip().lower()
+        if normalized not in KNOWN_ENVS:
+            raise ValueError(f"AIC_ENV must be one of {sorted(KNOWN_ENVS)} (got {value!r})")
+        return normalized
 
     # --- Quotas / limits (spec §19) ------------------------------------------
     rate_limit_per_minute: int = 120

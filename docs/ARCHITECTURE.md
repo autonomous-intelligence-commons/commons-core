@@ -199,3 +199,71 @@ Encrypted envelope JSON columns: `messages.envelope`,
   UPDATE` for quota/claim) are documented in code but unverified.
 - **Determinism:** tests use injected clocks and no network; simulated
   agents are fixtures, not AI.
+
+## 7. Worker execution timeout (Phase 1 hardening, Task 4)
+
+`AIC_TASK_TIMEOUT_SECONDS` is now operational. When > 0 (the worker passes
+the setting; direct service calls may inject their own value):
+
+1. `execute_claimed` runs the handler on a daemon thread and waits at most
+   `timeout_seconds` (wall-clock).
+2. Completion within the budget → success/failure as before.
+3. Timeout → the guard is REVOKED and the timeout is treated as a normal
+   handler failure: the transaction is rolled back first (discarding
+   partial handler writes), then the retry/backoff policy applies
+   (`attempts >= max_attempts` → terminal `failed`; otherwise `pending`
+   with `run_at = now + backoff`). `last_error` records the exception
+   class only — never payload content.
+4. **Execution guard** (`scheduler/service.py::_ExecutionGuard`): the
+   handler receives a revocable proxy of the Session. Every call first
+   acquires a lock and checks the revoked flag — after revocation any
+   session use raises `TaskExecutionRevokedError` BEFORE touching the
+   database. `revoke()` holds the same lock, so after it returns no
+   handler statement is in flight and none can start: an abandoned
+   (timed-out) handler thread can never commit a success or corrupt state
+   after the failure has been applied (test-proven:
+   `tests/operational/test_task_timeout.py::
+   test_abandoned_handler_cannot_use_session_after_timeout`).
+
+**Honest limits (documented, not hidden):** Python cannot forcibly
+terminate arbitrary running code. An abandoned thread that never touches
+the session again (e.g. stuck in `time.sleep` or a C extension call)
+cannot be killed in-process — it is bounded by lease expiry plus process
+restart. This is why `run_worker` REFUSES to start unless
+`lease_seconds > task_timeout_seconds` (a stuck-but-revoked handler must
+not outlive its lease and risk a second concurrent claim of the same
+task). Future AI execution requires independently cancellable execution
+environments and bounded external API calls; the Phase 1 mechanism bounds
+exactly the dangerous class of effects (database writes) that this
+architecture exposes.
+
+## 8. Production startup validation (Phase 1 hardening, Task 3)
+
+`create_app` validates security-critical configuration BEFORE wiring the
+application (fail-closed): in `AIC_ENV=production` a SQLite database URL
+is refused (`config/validation.py::ProductionConfigurationError`), and
+`AIC_MASTER_KEYS` is required (the ephemeral dev-key fallback is
+forbidden — encrypted data would be unrecoverable after restart). The
+KeyStore additionally rejects an empty `AIC_ACTIVE_KEY_ID`, unknown active
+kids, and placeholder-pattern keys. The worker and management CLI validate
+the database the same way but intentionally do NOT require keys (least
+privilege: they never decrypt content; compose withholds keys from the
+worker container). Invalid configuration → uvicorn exits non-zero before
+accepting any request (proven by the live subprocess matrix in
+docs/TESTING.md §6).
+
+## 9. PostgreSQL-specific behaviors (Phase 1 hardening, Task 1)
+
+- **Claim locking.** `claim_next` takes `FOR UPDATE SKIP LOCKED` on the
+  candidate scan when the dialect is PostgreSQL — concurrent workers skip
+  rows another worker is claiming instead of blocking on its row lock.
+  The conditional `UPDATE ... WHERE status='pending'` + rowcount check
+  remains the claim primitive on both backends; at-least-once semantics
+  are unchanged (no exactly-once claim is made).
+- **JSON portability.** PostgreSQL `json` has no equality operator, so
+  `SELECT DISTINCT` over entity rows containing `json` columns fails. The
+  activities/memory listing queries deduplicate through the ORM identity
+  map (`session.scalars(...).unique()`) instead of SQL DISTINCT.
+- **Timestamps.** `DateTime(timezone=True)` renders as `timestamptz` on
+  PostgreSQL and naive-UTC strings on SQLite; all comparisons normalize
+  through `as_utc` (behavior identical on both backends, test-proven).

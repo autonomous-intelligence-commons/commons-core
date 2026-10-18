@@ -14,8 +14,10 @@ import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from conftest import backend_database_url, reset_schema
 
 from commons_core.agents.service import provision_agent
+from commons_core.database.base import Base
 from commons_core.database.db import Database
 from commons_core.database.enums import TaskStatus
 from commons_core.infrastructure.system_state import read_system_state, write_system_state
@@ -33,10 +35,16 @@ def _later(value, *, seconds: int) -> datetime:
 
 @pytest.fixture()
 def file_database(tmp_path) -> Database:
-    """A file-backed database that is fully torn down (simulated restart)."""
-    url = f"sqlite+pysqlite:///{tmp_path}/recovery.db"
+    """A backend-aware database that is fully torn down (simulated restart).
+
+    SQLite: a per-test file (simulated process death via engine dispose).
+    PostgreSQL (AIC_TEST_DATABASE_URL): the shared test database — the same
+    URL across Database instances, which is exactly the multi-process /
+    multi-engine topology the recovery suite must prove on PostgreSQL.
+    """
+    url = backend_database_url(tmp_path, "recovery.db")
     database = Database(url)
-    database.init()
+    reset_schema(database)
     yield database
     database.dispose()
 
@@ -63,16 +71,18 @@ def _create(database: Database, agent, **overrides) -> str:
 
 class TestPersistenceAcrossRestart:
     def test_tasks_survive_engine_teardown_and_process_afterwards(self, tmp_path) -> None:
-        url = f"sqlite+pysqlite:///{tmp_path}/restart.db"
+        url = backend_database_url(tmp_path, "restart.db")
         first = Database(url)
-        first.init()
+        reset_schema(first)
         agent = _provision(first, "agent-restart")
         task_ids = [_create(first, agent) for _ in range(3)]
         first.dispose()  # simulated process death — nothing is committed in memory
 
         # NEW engine + sessions on the same file: tasks are still pending.
         second = Database(url)
-        second.init()
+        # create-only: the schema persists (dropping would erase the rows
+        # this test proves survive the restart).
+        Base.metadata.create_all(second.engine)
         with second.session() as session:
             for task_id in task_ids:
                 task = service.get_task(session, task_id)
@@ -91,9 +101,9 @@ class TestPersistenceAcrossRestart:
         second.dispose()
 
     def test_replay_of_idempotency_key_after_restart(self, tmp_path) -> None:
-        url = f"sqlite+pysqlite:///{tmp_path}/restart-idem.db"
+        url = backend_database_url(tmp_path, "restart-idem.db")
         first = Database(url)
-        first.init()
+        reset_schema(first)
         agent = _provision(first, "agent-idem")
         with first.session() as session:
             task, _ = service.create_task(
@@ -110,7 +120,9 @@ class TestPersistenceAcrossRestart:
         first.dispose()
 
         second = Database(url)
-        second.init()
+        # create-only: the schema persists (dropping would erase the rows
+        # this test proves survive the restart).
+        Base.metadata.create_all(second.engine)
         with second.session() as session:
             from commons_core.agents.service import get_agent_by_handle
 

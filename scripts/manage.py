@@ -41,6 +41,10 @@ from commons_core.agents.service import (  # noqa: E402
     suspend_agent,
 )
 from commons_core.config.settings import get_settings  # noqa: E402
+from commons_core.config.validation import (  # noqa: E402
+    ProductionConfigurationError,
+    validate_production_startup,
+)
 from commons_core.database.db import Database  # noqa: E402
 from commons_core.database.enums import CredentialStatus  # noqa: E402
 from commons_core.infrastructure.time import utc_now  # noqa: E402
@@ -176,7 +180,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    database = Database(get_settings().database_url)
+    settings = get_settings()
+    # Fail-closed startup: the CLI never decrypts content (no keys needed),
+    # but production refuses an unprotected SQLite datastore.
+    try:
+        validate_production_startup(settings, require_keys=False)
+    except ProductionConfigurationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    database = Database(settings.database_url)
     try:
         return args.func(args, database)
     except AgentError as exc:

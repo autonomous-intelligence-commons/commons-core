@@ -201,3 +201,45 @@ Branch protection / rulesets on `main`; Dependabot security alerts (config
 file included: `.github/dependabot.yml`); secret scanning; restricted
 deployment credentials; review of security-sensitive changes. Per spec §23,
 no GitHub organization settings were modified during Phase 1.
+
+## 11. Production configuration requirements (Phase 1 hardening — fail-closed)
+
+When `AIC_ENV=production` the application REFUSES to start unless ALL of
+the following hold (startup exits non-zero before accepting any request —
+proven by a live 8-case matrix, see docs/TESTING.md §6):
+
+1. `AIC_DATABASE_URL` targets PostgreSQL (`postgresql+psycopg://...`).
+   SQLite is refused for the API, the worker and the CLI.
+2. `AIC_MASTER_KEYS` is set: `kid:<64 hex chars>` (32-byte AES-256) per
+   key, comma-separated. Generate with:
+   `python -c "import secrets; print(secrets.token_hex(32))"`.
+3. `AIC_ACTIVE_KEY_ID` names one of the configured kids.
+4. No placeholder-pattern keys (all-f / deadbeef-repeat / sequential-hex /
+   all-zero — rejected at startup).
+
+The worker and management CLI do NOT require keys (least privilege — they
+never decrypt content; the compose worker container deliberately receives
+no `AIC_MASTER_KEYS`).
+
+Worker timing: `AIC_TASK_TIMEOUT_SECONDS` (default 30) is enforced. The
+worker refuses to start unless `lease_seconds > timeout` — compose runs
+`--lease-seconds 90` by default. Tune both together when changing limits.
+
+## 12. Key rotation and recovery (operational procedure)
+
+See docs/CRYPTOGRAPHY.md §6 for the full procedure. Summary: generate a
+new key → deploy with BOTH kids (`k1:<old>,k2:<new>`, `AIC_ACTIVE_KEY_ID=k2`)
+→ verify historical decryption → retain the old kid as long as recovery
+must remain possible (keys are required to decrypt backups; removal of a
+kid is an explicit, irreversible decision that makes its ciphertext
+undecryptable). Rotation requires a restart; history is not re-encrypted.
+
+## 13. Railway deployment prerequisites (unchanged posture)
+
+Environment variables required: `AIC_DATABASE_URL` (Railway PostgreSQL),
+`AIC_MASTER_KEYS`, `AIC_ACTIVE_KEY_ID`, `AIC_ENV=production`. Compatible
+with Railway env vars or sealed secrets; no external paid KMS. **No
+Railway deployment has been performed.** Private-network reachability is
+NOT an authorization boundary (spec §18). Run `alembic upgrade head`
+(migrate step) before starting api/worker; see §7 of this document and
+compose.yaml for the service topology.

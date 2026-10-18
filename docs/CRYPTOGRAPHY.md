@@ -194,3 +194,58 @@ tests; plus privacy suites). Suite result: **342 passed, 2 skipped**.
 7. No side-channel hardening claims (constant-time is applied to token
    comparison; AES-GCM in the `cryptography` library is the standard
    well-reviewed implementation).
+
+## 5. Production key management — fail-closed (Phase 1 hardening, Task 3)
+
+Environment-aware behavior (`AIC_ENV`):
+
+| Environment | Empty `AIC_MASTER_KEYS` | Behavior |
+| --- | --- | --- |
+| `development` / `test` | Ephemeral in-memory key (`dev-ephemeral`) with a loud warning | Disposable dev keys; **data encrypted with them is unrecoverable after restart** (documented risk) |
+| `production` | **REFUSED at startup** (`KeyConfigurationError`) | Fail-closed: no silent ephemeral fallback — encrypted messages and shared memory must never become unreadable because a process restarted |
+
+Production additionally validates (all test-proven in
+`tests/security/test_production_key_management.py` and the live
+subprocess matrix):
+
+- `AIC_MASTER_KEYS` present and parseable (64 hex chars = 32 bytes per key);
+- `AIC_ACTIVE_KEY_ID` non-empty and present among the configured kids;
+- placeholder-pattern keys rejected (all-f, repeated `deadbeef`,
+  sequential-hex `0123456789abcdef…`, all-zero — the last is rejected in
+  every environment);
+- the database URL is PostgreSQL (SQLite refused for the API, the worker
+  and the CLI);
+- key material is NEVER printed or logged (caplog tests assert no 64-hex
+  blobs — including in the ephemeral-key warning — and no plaintext).
+
+Railway compatibility: keys are plain environment variables
+(`AIC_MASTER_KEYS`, `AIC_ACTIVE_KEY_ID`) — compatible with Railway env
+vars or sealed secrets. No external paid KMS is introduced.
+
+## 6. Key rotation and recovery procedure (operational)
+
+Guarantees (test-proven):
+
+- New envelopes are always sealed with the ACTIVE kid;
+- historical ciphertext stays decryptable for every RETAINED kid;
+- removing a required historical kid makes its ciphertext fail with the
+  typed `UnknownKeyError` — an explicit error, never silent corruption;
+- corrupted/tampered ciphertext is rejected (`TamperDetectedError`,
+  `EnvelopeFormatError` — unchanged from §1).
+
+Safe rotation procedure:
+
+1. Generate the new key: `python -c "import secrets; print(secrets.token_hex(32))"`.
+2. Deploy with BOTH kids configured, old kid retained:
+   `AIC_MASTER_KEYS="k1:<old hex>,k2:<new hex>"`, `AIC_ACTIVE_KEY_ID=k2`.
+3. Verify decryption of historical messages/memory (a member retrieve or
+   an admin-approved spot check).
+4. Keep the old kid configured as long as recovery of historical data
+   must remain possible (keys are REQUIRED to decrypt backups — losing a
+   kid means its ciphertext is unrecoverable BY DESIGN).
+5. Only remove the old kid after backup/recovery requirements are
+   explicitly satisfied — removal is an explicit, irreversible decision.
+
+Historical data is NOT re-encrypted during rotation (documented
+limitation; unchanged). Rotation in a running system requires a restart
+(keys are read at startup); this matches the fail-closed model.

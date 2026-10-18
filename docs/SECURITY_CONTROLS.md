@@ -77,3 +77,36 @@ encryption (agent-held keys); transport TLS inside the app (deployment
 concern); mTLS; WAF/DDoS protection; SBOM or dependency signing; container
 image scanning; automated backups with restore tests; LLM-based (or any
 content-based) threat detection; compliance certification of any kind.
+
+## Phase 1 hardening additions (Task IDs 10/11)
+
+Status vocabulary used in this register: **Implemented and tested** (code +
+automated tests executed) / **Partially verified** (implemented; some
+verification pending an environment that does not exist here) /
+**Designed, not implemented** / **Deferred**.
+
+| ID | Control | Protects | Threat | Implementation | Verification | Status | Residual risk |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| SC-33 | Production fail-closed key management (no ephemeral fallback; active-kid + placeholder validation; SQLite refused) | Confidentiality of stored envelopes; recoverability after restart | T-15 (key loss/compromise), misconfiguration | `config/validation.py`, `key_store.py` (env-aware), `app.py` startup validation; worker/CLI least-privilege (no keys needed) | `tests/security/test_production_key_management.py` (24 tests) + live 8-case subprocess matrix (TESTING.md §6) | **Implemented and tested** | Keys required to decrypt backups; host/ Railway admins still exceed app-layer guarantees (not E2EE) |
+| SC-34 | Worker execution-timeout enforcement + abandoned-handler session guard | Availability; task-state integrity | T-06-style resource exhaustion via long-running handlers | `scheduler/service.py` (`execute_claimed(timeout_seconds)`, `_ExecutionGuard` revocable session proxy), `worker.py` (lease > timeout coherence) | `tests/operational/test_task_timeout.py` (10 tests incl. zombie-guard and concurrency) | **Implemented and tested** | No hard kill of non-session C calls — bounded by lease expiry + restart (documented) |
+| SC-35 | PostgreSQL-backed integration verification (migrations + full suite + scheduler concurrency with FOR UPDATE SKIP LOCKED) | Integrity of the production datastore path | SQLite-vs-PostgreSQL behavioral divergence | `tests/conftest.py` fail-loud backend selection; PG dialect locking in `claim_next`; backend-aware recovery tests | 382 passed / 2 skipped on PostgreSQL 16.2; alembic round-trip + schema inspection; live production E2E | **Implemented and tested** | CI replication of the PG job executes on GitHub Actions (same commands) |
+| SC-36 | Lease/timeout coherence enforcement | Task-state consistency under concurrency | Double-claim while a stuck handler lingers | `run_worker` refuses `lease_seconds <= task_timeout_seconds`; compose worker `--lease-seconds 90` vs default timeout 30 | `test_worker_refuses_lease_not_exceeding_timeout` | **Implemented and tested** | None known within stated semantics |
+| SC-37 | Docker image & compose verification in CI | Build integrity; runtime posture (non-root, secret injection, startup order) | T-12 supply chain / build drift | `.github/workflows/ci.yml` `docker` job (build, uid=1001 check, fail-closed startup check, compose stack + authenticated smoke + worker task + teardown) | Authored; NOT executable in the development sandbox (no Docker) | **Partially verified** (pending first GitHub Actions run after push) | First execution happens on the PR; any compose/port surprises surface there |
+
+Register updates to existing controls:
+
+- **SC-30 (supply chain):** CI now includes a PostgreSQL job (service
+  container) and a Docker build+compose job (runner tooling only, no
+  third-party Actions in the docker job); pip-audit remains non-blocking
+  but findings are VISIBLE (job log + JSON artifact + warning annotation)
+  and must be triaged per this document. Status of CI execution: the
+  original four jobs have run on GitHub since publication; the two new
+  jobs execute on the first push of this branch → **Partially verified**
+  until then.
+- **SC-32 (key rotation):** upgraded from "Implemented (design) /
+  partially verified" — rotation behavior is now covered by dedicated
+  automated tests (retained-kid decryptability, removal → typed
+  `UnknownKeyError`, active-kid sealing, production multi-kid startup) and
+  a documented operator procedure (CRYPTOGRAPHY.md §6, DEPLOYMENT.md) →
+  **Implemented and tested** (single-process scope; no re-encryption tool
+  remains a documented limitation).

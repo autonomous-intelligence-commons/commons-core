@@ -19,6 +19,7 @@ import argparse
 import logging
 
 from commons_core.config.settings import get_settings
+from commons_core.config.validation import validate_production_startup
 from commons_core.database.db import Database
 from commons_core.infrastructure.logging import configure_logging
 from commons_core.scheduler.worker import run_worker
@@ -44,14 +45,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     settings = get_settings()
+    # Fail-closed startup: the worker never decrypts content (least privilege
+    # — it receives NO AIC_MASTER_KEYS by design), but production still
+    # refuses an unprotected SQLite datastore.
+    validate_production_startup(settings, require_keys=False)
     configure_logging(settings)
     database = Database(settings.database_url)
     logger = logging.getLogger(__name__)
     logger.info(
-        "worker starting mode=%s database=%s lease_seconds=%s",
+        "worker starting mode=%s database=%s lease_seconds=%s task_timeout_seconds=%s",
         "once" if args.once else "loop",
         "configured",
         args.lease_seconds,
+        settings.task_timeout_seconds,
     )
     try:
         processed = run_worker(
@@ -60,6 +66,7 @@ def main(argv: list[str] | None = None) -> int:
             max_tasks=args.max_tasks,
             lease_seconds=args.lease_seconds,
             idle_sleep=args.idle_sleep,
+            task_timeout_seconds=float(settings.task_timeout_seconds),
         )
     finally:
         database.dispose()

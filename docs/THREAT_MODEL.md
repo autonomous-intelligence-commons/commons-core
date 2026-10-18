@@ -428,3 +428,35 @@ future phase. Test names refer to the current suite (342 passed / 2 skipped).
 - **No claim of complete security.** Residual risks are recorded per threat
   above; several controls (supply chain, backup/key custody, outbound
   policy) are partial or deferred.
+
+## Post-hardening residual-risk updates (Phase 1 Final Security Hardening)
+
+Targeted updates after the hardening pass (implementation + real
+PostgreSQL execution — see TESTING.md §6 for the executed evidence):
+
+- **Key loss / misconfiguration (T-15 family):** the silent ephemeral-key
+  fallback is now IMPOSSIBLE in production (fail-closed startup, test +
+  live proven). Residual: keys are still required to decrypt backups —
+  losing all copies of a kid makes its ciphertext unrecoverable by design;
+  rotation does not re-encrypt history. Status: control strengthened;
+  residual unchanged and documented.
+- **Task-handler resource exhaustion (T-06 family):** execution is now
+  bounded by `AIC_TASK_TIMEOUT_SECONDS` (guarded thread, revocable session
+  proxy; timeout → retry/backoff → terminal failed; lease/timeout
+  coherence enforced). Residual (honest): Python cannot hard-kill a
+  handler stuck in non-session C calls — bounded by lease expiry and
+  process restart; future AI execution needs independently cancellable
+  environments. Status: control implemented and tested; residual
+  documented in ARCHITECTURE.md §7.
+- **SQLite-vs-PostgreSQL divergence:** eliminated as a threat to the
+  production path — the full suite, migrations round-trip, scheduler
+  concurrency (`FOR UPDATE SKIP LOCKED`) and a live production E2E all
+  execute against PostgreSQL 16.2; a real `SELECT DISTINCT`-on-json
+  incompatibility was found and fixed by this verification.
+- **Supply chain / CI (T-12):** CI now also builds the Docker image,
+  boots the compose stack and runs an authenticated smoke test; the docker
+  job invokes no third-party Actions. Residual: first execution happens on
+  GitHub Actions after the branch is pushed (no Docker runtime existed in
+  the authoring sandbox); pip-audit remains non-blocking but visible.
+- **Observability of secrets:** key material is never logged (new caplog
+  tests, including the ephemeral warning path).
