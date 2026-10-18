@@ -31,7 +31,12 @@ if config.config_file_name is not None:
 
 # Resolve the URL from application settings (AIC_DATABASE_URL).
 settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# alembic's config file layer is a ConfigParser with %-interpolation: escape
+# literal percent signs before set_main_option, otherwise a percent-encoded
+# userinfo (Railway-generated passwords commonly contain '%', '@', etc.)
+# raises "invalid interpolation syntax". Offline mode reads the value back
+# through the parser, which un-escapes '%%' to '%'. (alembic FAQ pattern.)
+config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
 
 target_metadata = Base.metadata
 
