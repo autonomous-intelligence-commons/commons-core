@@ -269,6 +269,36 @@ jobs:
         run: |
           docker compose ps worker | grep -q "Up" || { docker compose logs worker; exit 1; }
           echo "worker running (no HTTP healthcheck — by design, spec §16)"
+      - name: Diagnose failing services (sanitized migrate/postgres logs)
+        # Runs on ANY docker-job failure, BEFORE cleanup removes containers,
+        # so the actual migrate traceback is preserved in the job log.
+        # PRIVACY: output is redacted — DB URLs (user:password@), password
+        # assignments, AIC_MASTER_KEYS values and 64-hex key material are
+        # masked; docker inspect is restricted to state fields only (Env is
+        # never printed). Diagnostics must never mask the original failure.
+        if: failure()
+        run: |
+          echo "::group::Service states (docker compose ps -a)"
+          docker compose ps -a || true
+          echo "::endgroup::"
+          echo "::group::Container exit status and state (state fields only — Env never printed)"
+          for svc in postgres migrate api worker; do
+            cid=$(docker compose ps -aq "$svc" 2>/dev/null)
+            if [ -n "$cid" ]; then
+              docker inspect --format '{{.Name}}: status={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} started={{.State.StartedAt}} finished={{.State.FinishedAt}} error={{.State.Error}}' "$cid" || true
+            else
+              echo "$svc: no container on this project"
+            fi
+          done
+          echo "::endgroup::"
+          echo "::group::migrate + postgres logs (credentials redacted)"
+          docker compose logs --no-color --timestamps --tail 400 migrate postgres 2>&1 | sed -E \
+            -e 's#(://[^:/@[:space:]]+:)[^@[:space:]]+@#\1***@#g' \
+            -e 's#([Pp]assword[[:space:]]*[:=][[:space:]]*)[^[:space:]]+#\1***#g' \
+            -e 's#(POSTGRES_PASSWORD|AIC_MASTER_KEYS|AIC_DATABASE_URL)=[^[:space:]]+#\1=***REDACTED***#g' \
+            -e 's#\b[0-9a-f]{64}\b#***HEX64-REDACTED***#g' \
+            || true
+          echo "::endgroup::"
       - name: Shut down cleanly and remove containers + volumes
         if: always()
         run: |
