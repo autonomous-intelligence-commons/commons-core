@@ -20,8 +20,16 @@
 
 name: commons-core
 
+# Single source of truth for stack database credentials: BOTH the postgres
+# service below AND this shared anchor derive their values from the SAME
+# three variables (POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB, set in
+# the environment or .env — synthetic, CI-only values in the docker CI job).
+# URL-encoding note: the password is interpolated into the URL userinfo
+# VERBATIM — keep POSTGRES_PASSWORD URL-safe (alphanumeric plus -_.~) or
+# percent-encode it yourself when overriding (e.g. '@' -> '%40'); the CI
+# job asserts this round-trip before any container starts.
 x-app-database: &app-database
-  AIC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-commons}:${POSTGRES_PASSWORD:-commons-dev}:${POSTGRES_DB:-commons}@postgres:5432/${POSTGRES_DB:-commons}
+  AIC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-commons}:${POSTGRES_PASSWORD:-commons-dev}@postgres:5432/${POSTGRES_DB:-commons}
 
 services:
   postgres:
@@ -33,6 +41,10 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
+      # NOTE: pg_isready proves the SERVER is up and accepting connections —
+      # it does NOT exercise password authentication (the migration service
+      # authenticating is verified separately by CI before containers start
+      # and by the migrate one-shot job itself).
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-commons} -d ${POSTGRES_DB:-commons}"]
       interval: 5s
       timeout: 3s

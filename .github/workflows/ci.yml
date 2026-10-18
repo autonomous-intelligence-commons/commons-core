@@ -224,6 +224,63 @@ jobs:
           assert offenders == {"api": [8010]}, offenders
           print("port exposure OK: only api publishes 8010")
           '
+      - name: Verify compose-injected DB credentials match the postgres service
+        # The postgres healthcheck (pg_isready) proves the server is UP but
+        # never exercises password authentication — a credential mismatch in
+        # the compose topology otherwise only surfaces when migrate tries to
+        # connect (PR #5: "FATAL: password authentication failed for user
+        # \"commons\"" — caused by a stray ${POSTGRES_DB} interpolated into
+        # the URL userinfo, corrupting the password). This assertion parses
+        # the RESOLVED compose config BEFORE any container starts and proves
+        # the URL userinfo equals the postgres service credentials (password
+        # in canonical percent-encoded form), that migrate/api/worker share
+        # ONE URL, and that both match the CI job intent. PRIVACY: on
+        # mismatch only component NAMES are printed — usernames, passwords
+        # and the URL itself are never echoed.
+        run: |
+          docker compose config --format json | python3 -c '
+          import json, os, sys
+          from urllib.parse import quote, unquote, urlsplit
+
+          cfg = json.load(sys.stdin)
+          pg = cfg["services"]["postgres"]["environment"]
+          url = cfg["services"]["migrate"]["environment"]["AIC_DATABASE_URL"]
+
+          problems = []
+          # 1) the credentials the POSTGRES CONTAINER is initialized with
+          #    must equal what the APP SERVICES will connect with.
+          parts = urlsplit(url)
+          if unquote(parts.username or "") != pg["POSTGRES_USER"]:
+              problems.append("URL username != postgres POSTGRES_USER")
+          # The URL password must be the CANONICAL percent-encoding of the
+          # postgres password: this catches BOTH wrong values (the PR #5
+          # incident — a stray ${POSTGRES_DB} term corrupted the userinfo)
+          # AND special characters inserted raw instead of encoded (RFC 3986:
+          # a raw '@' silently re-parses as a host separator, ':' as a
+          # username/password delimiter).
+          if (parts.password or "") != quote(pg["POSTGRES_PASSWORD"], safe=""):
+              problems.append("URL password != canonical percent-encoding of postgres POSTGRES_PASSWORD")
+          if (parts.path or "").lstrip("/") != pg["POSTGRES_DB"]:
+              problems.append("URL database != postgres POSTGRES_DB")
+          if parts.scheme != "postgresql+psycopg":
+              problems.append("URL scheme is not postgresql+psycopg")
+
+          # 2) single source of truth: all app services share ONE URL.
+          for svc in ("api", "worker"):
+              if cfg["services"][svc]["environment"]["AIC_DATABASE_URL"] != url:
+                  problems.append(f"{svc} AIC_DATABASE_URL differs from migrate")
+
+          # 3) the resolved values must match the CI job intent.
+          for var, key in (("POSTGRES_USER", "POSTGRES_USER"),
+                           ("POSTGRES_PASSWORD", "POSTGRES_PASSWORD"),
+                           ("POSTGRES_DB", "POSTGRES_DB")):
+              intended = os.environ.get(var)
+              if intended is not None and intended != pg[key]:
+                  problems.append(f"postgres {key} != CI env {var}")
+
+          assert not problems, "database credential mismatch: " + "; ".join(problems)
+          print("compose DB credentials consistent: postgres <-> migrate/api/worker <-> CI env (values never printed)")
+          '
       - name: Start the full stack (postgres → migrate → api + worker)
         run: docker compose up -d --build
       - name: Confirm migrations completed before dependent services
