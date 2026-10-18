@@ -74,10 +74,15 @@ jobs:
         uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
         with:
           python-version: "3.12"
-      - name: Install application + dev dependencies (pinned)
+      # ".[dev,postgres]": the suite includes production fail-closed startup
+      # tests that build a real SQLAlchemy engine for a postgresql+psycopg://
+      # URL (tests/security/test_production_key_management.py). Importing the
+      # psycopg dialect requires the driver even though the tests never
+      # connect — without the extra they fail with ModuleNotFoundError.
+      - name: Install application + dev + postgres dependencies (pinned)
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev,postgres]"
       - name: Run the deterministic test suite (no network, no real AI)
         run: python -m pytest -q --junitxml=pytest-results.xml
       - name: Upload test results
@@ -205,8 +210,14 @@ jobs:
           docker compose config --format json | python3 -c '
           import json, sys
           cfg = json.load(sys.stdin)
+          def normalize(value):
+              # docker compose reports published host ports as STRINGS when
+              # they originate from environment interpolation (${AIC_API_PORT})
+              # and as integers when they come from literal YAML — normalize
+              # to int before comparing (security check must be type-stable).
+              return int(value) if value is not None else None
           published = {
-              name: [p.get("published") for p in svc.get("ports", [])]
+              name: [normalize(p.get("published")) for p in svc.get("ports", [])]
               for name, svc in cfg["services"].items()
           }
           offenders = {n: p for n, p in published.items() if p}
@@ -311,10 +322,43 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e . pip-audit==2.10.1
-      - name: Audit the installed environment (report visible, non-blocking)
-        run: pip-audit --strict --format json --output pip-audit-report.json || {
-            echo "::warning::pip-audit reported advisories — see the pip-audit-report artifact and docs/SECURITY_CONTROLS.md (triage process)";
-            exit 1; }
+      - name: Audit the installed third-party dependencies (report visible, non-blocking)
+        run: |
+          set -o pipefail
+          # commons-core is installed EDITABLE and is NOT published on PyPI:
+          # auditing the live environment makes pip-audit resolve it against
+          # PyPI and abort with "Dependency not found on PyPI". Instead, freeze
+          # the environment WITHOUT the local project into a fully-pinned
+          # lockfile and audit exactly that (every installed third-party
+          # dependency, including pip-audit's own tree).
+          # (report removed up-front so a stale file can never be mistaken
+          # for a fresh vulnerability finding below)
+          rm -f pip-audit-report.json
+          python -m pip freeze --exclude-editable \
+            | grep -vE '^(#|-e|pkg-resources==)' \
+            > requirements-audit.lock
+          # Fail-loud guard: a broken/partial freeze must not silently shrink
+          # the audit surface to a near-empty lockfile (fake-green scan).
+          count=$(grep -c . requirements-audit.lock || true)
+          if [ "$count" -lt 20 ]; then
+            echo "::error::pip freeze produced only $count pinned dependencies — refusing to audit an incomplete environment"
+            exit 2
+          fi
+          echo "auditing $count pinned third-party dependencies"
+          set +e
+          pip-audit --requirement requirements-audit.lock --no-deps --strict \
+            --format json --output pip-audit-report.json
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "pip-audit: scan complete — no known vulnerabilities"
+          elif [ -f pip-audit-report.json ]; then
+            echo "::warning::pip-audit reported advisories — see the pip-audit-report artifact and docs/SECURITY_CONTROLS.md (triage process)"
+            exit 1
+          else
+            echo "::error::pip-audit failed to complete (exit $rc, no report produced) — scan execution error, not a vulnerability finding"
+            exit 2
+          fi
       - name: Upload the audit report (always, even with findings)
         if: always()
         uses: actions/upload-artifact@v4 # TODO: pin to commit SHA after first verified run
