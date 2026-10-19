@@ -115,16 +115,23 @@ drain access per platform best practice. `AIC_LOG_LEVEL=INFO` recommended.
   `pg_dump`/Railway backup is only usable together with the master keys:
   **losing the keys = permanently losing the encrypted data** (messages,
   memory, activity summaries, governance content).
-- Recommended procedure (to be performed when deployment is authorized):
-  scheduled `pg_dump` (Railway database backups or a cron job running
-  `pg_dump` with private-network access), stored encrypted at rest by the
-  provider, access-restricted; keys backed up independently (offline secure
-  copy of `AIC_MASTER_KEYS`), never in the repo.
-- Restore: `pg_restore`/`psql` into a fresh database → `alembic upgrade
-  head` (schema check) → point `AIC_DATABASE_URL` → start api/worker →
-  verify with `GET /health` + a sample authorized read. **No automated
-  restore test against PostgreSQL exists in Phase 1** (documented gap — see
-  `docs/TESTING.md` §untested).
+- **Stage 1 backup tooling is implemented** (ADR-0009): a streaming
+  `pg_dump → age`-encrypted backup pipeline, verified atomic publication,
+  and a fail-closed synthetic restore drill now exist in this repository
+  with CI coverage against real PostgreSQL 16 and 18 — see
+  `docs/BACKUP.md` for usage, scope, and the Stage 2+ plan. The earlier
+  Phase 1 gap "no automated restore test against PostgreSQL" is closed at
+  the synthetic level; a real-data drill remains a future, separately
+  authorized stage.
+- Recommended procedure (when production deployment is authorized):
+  the dedicated backup workload of ADR-0009 (Railway Cron, private-network
+  `pg_dump`, age public-key encryption, off-provider storage); keys backed
+  up independently (offline secure copy of `AIC_MASTER_KEYS`), never in
+  the repo.
+- Restore: use the restore-drill tooling of `docs/BACKUP.md` against a
+  **disposable** target first; pointing production back at the restored
+  data is a manual, separately reviewed procedure (there is deliberately
+  no automatic production restore command).
 
 ## 7. Key rotation procedure
 

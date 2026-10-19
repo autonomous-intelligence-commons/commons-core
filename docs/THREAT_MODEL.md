@@ -460,3 +460,17 @@ PostgreSQL execution — see TESTING.md §6 for the executed evidence):
   the authoring sandbox); pip-audit remains non-blocking but visible.
 - **Observability of secrets:** key material is never logged (new caplog
   tests, including the ephemeral warning path).
+- **Backup & recovery (ADR-0009, Stage 1):** repository-side encrypted-
+  backup tooling (streaming `pg_dump → age`, verified atomic publication,
+  fail-closed synthetic restore drill) is now implemented and covered in
+  CI against real PostgreSQL 16 and 18 — the threat "a backup exists but
+  cannot be verified restorable" is closed at the synthetic level.
+  Residual (honest): no off-provider copy exists yet (Stage 3); the age
+  identity has no two-copy offline escrow yet (Stage 2 — until then a
+  lost identity makes every backup undecryptable); a compromised future
+  backup workload can still exfiltrate fresh dumps of whatever its
+  SELECT-only DB role can read (mitigations staged in BACKUP.md §6);
+  verifiable deletion beyond the retention horizon remains impossible
+  while old encrypted backups exist (documented, not solvable by
+  immutability). See `docs/BACKUP.md` (threat model §6, deletion limits
+  §8) and `docs/ADR/0009-*`.
