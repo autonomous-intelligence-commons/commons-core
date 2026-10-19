@@ -218,3 +218,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Backup & recovery artifacts (ADR-0009 / docs/BACKUP.md).
+# Generated encrypted backups, staged uploads, decrypted dumps, and age
+# identities must never be committed. Stage 1 tests generate SYNTHETIC
+# identities at runtime in temporary directories instead of committing
+# fixture keys (independent-review correction 6).
+*.age
+*.age.part
+*.pgdump
+*.dump
+*.backup
+age-identity*.txt

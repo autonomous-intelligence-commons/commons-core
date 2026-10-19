@@ -6,7 +6,14 @@
 #   postgres — REAL PostgreSQL 16 service container: alembic
 #              upgrade/downgrade/upgrade round-trip + the FULL test suite
 #              against PostgreSQL via AIC_TEST_DATABASE_URL (fail-loud: the
-#              suite aborts rather than falling back to SQLite).
+#              suite aborts rather than falling back to SQLite). Also runs
+#              the ADR-0009 Stage 1 backup tests against this PG 16 server.
+#   backup-postgres18 — ADR-0009 Stage 1: the full backup/recovery suite
+#              (streaming pg_dump→age pipeline, atomic publication, restore
+#              drill, fault injection) against a REAL pinned PostgreSQL
+#              18.6 service container + pinned 18.6 client + pinned age
+#              v1.3.2. Fail-loud: the job fails if any mandatory backup
+#              verification fails; there is no silent skip.
 #   docker   — REAL container build + compose stack verification: non-root
 #              user, fail-closed production startup, postgres+migrate+api+
 #              worker startup order, authenticated API smoke, deterministic
@@ -155,6 +162,29 @@ jobs:
         run: alembic downgrade base
       - name: Re-apply all migrations (round-trip, PostgreSQL)
         run: alembic upgrade head
+      - name: Install age v1.3.2 (ADR-0009 backup tests — pinned, checksum-verified)
+        run: |
+          curl -fsSL -o /tmp/age.tar.gz \
+            "https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz"
+          echo "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10  /tmp/age.tar.gz" \
+            | sha256sum --check --strict
+          tar -xzf /tmp/age.tar.gz -C /tmp
+          test "$(/tmp/age/age --version)" = "v1.3.2" \
+            || { echo "FAIL: age version is not the pinned v1.3.2"; exit 1; }
+          echo "age v1.3.2 verified (tarball sha256 pinned)"
+      - name: Install PostgreSQL 16 client tools (backup pipeline tests)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q postgresql-client-16
+          pg_dump --version
+          pg_restore --version
+      - name: Configure backup-test environment (ADR-0009 Stage 1, PostgreSQL 16)
+        run: |
+          echo "AIC_BACKUP_TEST_ADMIN_URL=postgresql+psycopg://commons:commons-ci@localhost:5432/postgres" >> "$GITHUB_ENV"
+          echo "AIC_BACKUP_TEST_APP_ROLE=commons" >> "$GITHUB_ENV"
+          echo "AIC_BACKUP_TEST_APP_PASSWORD=commons-ci" >> "$GITHUB_ENV"
+          echo "AIC_BACKUP_AGE_BIN=/tmp/age/age" >> "$GITHUB_ENV"
+          echo "AIC_BACKUP_AGE_KEYGEN_BIN=/tmp/age/age-keygen" >> "$GITHUB_ENV"
       - name: Run the FULL suite against PostgreSQL (no fallback)
         run: python -m pytest -q --junitxml=pytest-pg-results.xml
       - name: Upload PostgreSQL test results
@@ -163,6 +193,97 @@ jobs:
         with:
           name: pytest-pg-results
           path: pytest-pg-results.xml
+          if-no-files-found: error
+
+  backup-postgres18:
+    name: Backup pipeline — PostgreSQL 18 integration (ADR-0009 Stage 1)
+    runs-on: ubuntu-latest
+    # ADR-0009 review correction 5: production runs PostgreSQL 18.6, so the
+    # mandatory backup/recovery verification must run against the same
+    # major. Fail-loud by construction: no skip markers, no fallback —
+    # a red job here means the backup guarantee is broken. The production
+    # acceptance criteria treat this job as required (owners must add it
+    # to the branch-protection required-check list when enabling it).
+    services:
+      postgres18:
+        image: postgres:18.6-alpine # exact-version pin
+        env:
+          POSTGRES_USER: commons
+          POSTGRES_PASSWORD: commons-ci
+          POSTGRES_DB: commons
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U commons -d commons"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
+        with:
+          python-version: "3.12"
+      - name: Install application + dev + postgres dependencies (pinned)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,postgres]"
+      - name: Install age v1.3.2 (pinned, checksum-verified)
+        run: |
+          curl -fsSL -o /tmp/age.tar.gz \
+            "https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz"
+          echo "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10  /tmp/age.tar.gz" \
+            | sha256sum --check --strict
+          tar -xzf /tmp/age.tar.gz -C /tmp
+          test "$(/tmp/age/age --version)" = "v1.3.2" \
+            || { echo "FAIL: age version is not the pinned v1.3.2"; exit 1; }
+          echo "age v1.3.2 verified (tarball sha256 pinned)"
+      - name: Install PostgreSQL 18.6 client tools (pinned debs, checksum-verified)
+        # The dump/restore client must be >= the server major (upstream
+        # rule). The runner's default client is 16, so we install the exact
+        # 18.6 client from the official PGDG pool as self-contained debs
+        # (no apt-repo trust changes; dpkg-deb -x needs no root).
+        run: |
+          set -e
+          mkdir -p pg18-tools && cd pg18-tools
+          curl -fsSL -o client18.deb \
+            "https://apt.postgresql.org/pub/repos/apt/pool/main/p/postgresql-18/postgresql-client-18_18.6-1.pgdg24.04%2B2_amd64.deb"
+          echo "b9d10d99a73bf7aa375be2fe36626c40499cfdf553d0ad174674a88a1b256b43  client18.deb" \
+            | sha256sum --check --strict
+          curl -fsSL -o libpq18.deb \
+            "https://apt.postgresql.org/pub/repos/apt/pool/main/p/postgresql-18/libpq5_18.6-3.pgdg24.04%2B1_amd64.deb"
+          echo "29452c26315aeefeb900895b20b3e8adbd33c32cb9b602a83c30ac5cea1c2055  libpq18.deb" \
+            | sha256sum --check --strict
+          dpkg-deb -x client18.deb ./
+          dpkg-deb -x libpq18.deb ./
+          CLIENT=./usr/lib/postgresql/18/bin
+          export LD_LIBRARY_PATH="$PWD/usr/lib/x86_64-linux-gnu"
+          "$CLIENT/pg_dump" --version
+          "$CLIENT/pg_restore" --version
+          echo "LD_LIBRARY_PATH=$PWD/usr/lib/x86_64-linux-gnu" >> "$GITHUB_ENV"
+          echo "AIC_BACKUP_PG_TOOLS_DIR=$PWD/$CLIENT" >> "$GITHUB_ENV"
+          echo "AIC_BACKUP_PG_DUMP_BIN=$PWD/$CLIENT/pg_dump" >> "$GITHUB_ENV"
+          echo "AIC_BACKUP_PG_RESTORE_BIN=$PWD/$CLIENT/pg_restore" >> "$GITHUB_ENV"
+      - name: Configure backup-test environment (PostgreSQL 18.6)
+        run: |
+          echo "AIC_BACKUP_TEST_ADMIN_URL=postgresql+psycopg://commons:commons-ci@localhost:5432/postgres" >> "$GITHUB_ENV"
+          echo "AIC_BACKUP_TEST_APP_ROLE=commons" >> "$GITHUB_ENV"
+          echo "AIC_BACKUP_TEST_APP_PASSWORD=commons-ci" >> "$GITHUB_ENV"
+          echo "AIC_BACKUP_AGE_BIN=/tmp/age/age" >> "$GITHUB_ENV"
+          echo "AIC_BACKUP_AGE_KEYGEN_BIN=/tmp/age/age-keygen" >> "$GITHUB_ENV"
+      - name: Run the backup/recovery suite against PostgreSQL 18.6
+        run: |
+          pg_dump --version 2>/dev/null || true
+          echo "pg tools dir: ${AIC_BACKUP_PG_TOOLS_DIR:-unset}"
+          python -m pytest tests/operational/test_backup_pipeline.py -q \
+            --junitxml=pytest-backup18-results.xml
+      - name: Upload backup PG18 test results
+        if: always()
+        uses: actions/upload-artifact@v4 # TODO: pin to commit SHA after first verified run
+        with:
+          name: pytest-backup18-results
+          path: pytest-backup18-results.xml
           if-no-files-found: error
 
   docker:
