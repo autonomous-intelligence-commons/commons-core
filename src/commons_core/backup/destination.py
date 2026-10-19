@@ -19,6 +19,18 @@ here is deliberately paranoid:
   scheme, host, port, and database name remain (operational context
   without any identity material).
 
+R10 hardening — the guard and the effective connection are now the SAME
+thing: ``validate_restore_destination`` parses the URL through the
+single canonical connection contract
+(:mod:`commons_core.backup.connection`) that every execution path
+(SQLAlchemy, ``pg_dump``, ``pg_restore``) also uses. Query parameters that
+could redirect the connection (``host``, ``hostaddr``, ``port``,
+``service``, ``user``, ``dbname``, ``options``, ``passfile``, …) are
+rejected before any policy check, inherited ``PG*`` environment variables
+are scrubbed by the drill before any connection is made, and hostless
+URLs (Unix-socket fallback) are refused outright. The guard can no longer
+say "127.0.0.1 is safe" while the tools connect somewhere else.
+
 Heuristic limitations (documented honestly, per the review):
 
 * A hostname such as ``db.internal.example`` is neither a literal IP nor a
@@ -28,6 +40,8 @@ Heuristic limitations (documented honestly, per the review):
 * The production database could in principle sit on a private IP too, so
   the allowlist of disposable *names* is the real gate — never rely on the
   host check alone.
+* No syntactic host/port check constitutes a network boundary: real
+  isolation requires network controls (see docs/BACKUP.md).
 """
 
 from __future__ import annotations
@@ -36,6 +50,8 @@ import ipaddress
 import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit
+
+from .connection import CanonicalConnection, ConnectionContractError
 
 PRODUCTION_HOST_HINTS = re.compile(r"railway|rlwy", re.IGNORECASE)
 DEFAULT_DISPOSABLE_DB_PATTERN = re.compile(
@@ -91,20 +107,23 @@ def _host_is_local(host: str) -> bool:
 
 
 def parse_target(url: str) -> DestinationTarget:
-    parts = urlsplit(url)
-    host = parts.hostname or ""
-    if not host:
-        raise UnsafeDestinationError("database URL has no host component")
+    """Parse a URL through the canonical contract (fail-closed).
+
+    R10: this now goes through :class:`CanonicalConnection`, so a URL that
+    only *looks* safe (query-string host overrides, unsupported parameters,
+    Unix-socket fallback, duplicate parameters) is rejected here — the same
+    parser the execution paths use, never a divergent one.
+    """
     try:
-        port = parts.port if parts.port else 5432
-    except ValueError as exc:
-        raise UnsafeDestinationError(f"database URL has an invalid port: {exc}") from exc
-    database = parts.path.lstrip("/")
+        canonical = CanonicalConnection.from_url(url)
+    except ConnectionContractError as exc:
+        raise UnsafeDestinationError(str(exc)) from exc
+    host = canonical.host
     return DestinationTarget(
         host=host,
-        port=port,
-        database_name=database,
-        user=parts.username,
+        port=canonical.port,
+        database_name=canonical.database_name,
+        user=canonical.user,
         is_nonlocal=not _host_is_local(host),
     )
 
@@ -120,13 +139,18 @@ def validate_restore_destination(
 
     Rules (all must pass — fail-closed):
 
-    1. scheme must be ``postgresql`` (optionally with the ``+psycopg``
+    1. the URL must satisfy the canonical connection contract
+       (:mod:`commons_core.backup.connection`): explicit host (no Unix-socket
+       fallback), no destination-redirecting or unsupported query
+       parameters, no duplicate parameters — the exact contract every
+       execution path uses (R10);
+    2. scheme must be ``postgresql`` (optionally with the ``+psycopg``
        driver suffix used by SQLAlchemy URLs);
-    2. the host must not look like a Railway endpoint (hard refusal that
+    3. the host must not look like a Railway endpoint (hard refusal that
        no flag overrides — the live production database lives there);
-    3. the host must be loopback/private, unless ``allow_nonlocal`` was
+    4. the host must be loopback/private, unless ``allow_nonlocal`` was
        explicitly passed (recorded in the drill report);
-    4. the database name must match the disposable-database pattern or be
+    5. the database name must match the disposable-database pattern or be
        present in ``allowed_db_names``.
     """
     parts = urlsplit(url)

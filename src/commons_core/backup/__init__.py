@@ -29,6 +29,12 @@ custody packages (ADR-0010): two-copy redundancy, content-blind verification,
 and exports for disaster recovery, with the same never-a-secret-in-argv rules.
 """
 
+from .connection import (
+    CanonicalConnection,
+    ConnectionContractError,
+    canonical_from_url,
+    scrubbed_pg_environ,
+)
 from .destination import (
     UnsafeDestinationError,
     describe_url,
@@ -40,9 +46,11 @@ from .pipeline import (
     ArtifactVerificationFailed,
     BackupError,
     BackupOutcome,
+    DeadlineExceeded,
     DumpFailed,
     EncryptionFailed,
     PreflightError,
+    PublicationFailed,
     run_backup,
 )
 from .recovery_keys import (
@@ -63,11 +71,18 @@ from .recovery_keys import (
     unlock_recovery_package,
     verify_recovery_package,
 )
-from .restore import DrillFailure, DrillReport, run_restore_drill, verify_restored_database
+from .restore import (
+    DrillCleanupError,
+    DrillFailure,
+    DrillReport,
+    run_restore_drill,
+    verify_restored_database,
+)
 from .storage import (
     BackupConflictError,
     LocalFilesystemStorage,
     MissingBackupObject,
+    PublishedSetCorrupted,
     StorageError,
 )
 from .tools import Toolbelt, ToolError, locate_toolbelt
@@ -79,11 +94,14 @@ __all__ = [
     "BackupError",
     "BackupManifest",
     "BackupOutcome",
+    "DeadlineExceeded",
     "DumpFailed",
     "EncryptionFailed",
     "LocalFilesystemStorage",
     "MissingBackupObject",
     "PreflightError",
+    "PublicationFailed",
+    "PublishedSetCorrupted",
     "StorageError",
     "Toolbelt",
     "ToolError",
@@ -91,14 +109,19 @@ __all__ = [
     "new_backup_id",
     "run_backup",
     # restore side
+    "DrillCleanupError",
     "DrillFailure",
     "DrillReport",
     "run_restore_drill",
     "verify_restored_database",
     # safety helpers
+    "CanonicalConnection",
+    "ConnectionContractError",
     "UnsafeDestinationError",
+    "canonical_from_url",
     "describe_url",
     "scrub_secrets",
+    "scrubbed_pg_environ",
     "validate_restore_destination",
     # recovery custody (Stage 2)
     "AgeIdentity",
