@@ -5,9 +5,18 @@ Usage:
     # process at most one eligible task (scripted operation / cron / tests)
     .venv/bin/python scripts/run_worker.py --once
 
-    # continuous loop until SIGTERM/SIGINT or max tasks (graceful shutdown:
-    # the in-flight task completes before exit)
+    # continuous loop, UNLIMITED tasks, until SIGTERM/SIGINT or fatal
+    # failure (graceful shutdown: the in-flight task completes before exit;
+    # the default idle poll is 1s — see --idle-sleep)
+    .venv/bin/python scripts/run_worker.py --loop
+
+    # loop with an EXPLICIT task cap (tests / scripted batches)
     .venv/bin/python scripts/run_worker.py --loop --max-tasks 1000
+
+There is NO default task cap: omitting --max-tasks in --loop mode runs the
+worker for its whole lifetime (the Railway semantics). --max-tasks is a
+loop-only bound and must be a positive integer; combining it with --once is
+rejected (argparse error), as are non-positive or negative values.
 
 The worker needs the database (``AIC_DATABASE_URL``) but NOT the API
 server. Apply migrations first: ``.venv/bin/alembic upgrade head``. While
@@ -37,12 +46,44 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument(
         "--loop", action="store_true", help="run continuously until stopped (default)"
     )
-    parser.add_argument("--max-tasks", type=int, default=100, help="task cap per loop run")
-    parser.add_argument("--lease-seconds", type=int, default=30, help="execution lease duration")
     parser.add_argument(
-        "--idle-sleep", type=float, default=0.05, help="seconds to sleep between idle polls"
+        "--max-tasks",
+        type=int,
+        default=None,
+        help=(
+            "explicit positive cap on tasks processed in --loop mode "
+            "(default: unlimited — run until shutdown signal)"
+        ),
+    )
+    parser.add_argument(
+        "--lease-seconds",
+        type=int,
+        default=90,
+        help=(
+            "execution lease duration (default: 90 — MUST exceed "
+            "AIC_TASK_TIMEOUT_SECONDS, whose default is 30; the worker "
+            "refuses to start otherwise)"
+        ),
+    )
+    parser.add_argument(
+        "--idle-sleep",
+        type=float,
+        default=1.0,
+        help="seconds to sleep between idle polls (default: 1.0 — one DB poll/second while idle)",
     )
     args = parser.parse_args(argv)
+
+    # Fail-closed argument validation: an invalid explicit task limit (or a
+    # contradictory mode combination) is REJECTED with a clean usage error
+    # instead of being silently accepted (exit code 2, message on stderr).
+    if args.max_tasks is not None and args.max_tasks < 1:
+        parser.error(f"--max-tasks must be a positive integer (got {args.max_tasks})")
+    if args.once and args.max_tasks is not None:
+        parser.error(
+            "--max-tasks bounds --loop runs only: --once already processes at most one task"
+        )
+    if args.idle_sleep < 0:
+        parser.error(f"--idle-sleep must be >= 0 (got {args.idle_sleep})")
 
     settings = get_settings()
     # Fail-closed startup: the worker never decrypts content (least privilege
@@ -51,13 +92,22 @@ def main(argv: list[str] | None = None) -> int:
     validate_production_startup(settings, require_keys=False)
     configure_logging(settings)
     database = Database(settings.database_url)
-    logger = logging.getLogger(__name__)
+    # Logger UNDER the commons_core tree: configure_logging() attaches its
+    # privacy-preserving stderr handler to that tree only. A bare
+    # ``getLogger(__name__)`` here resolves to ``__main__`` when this file
+    # runs as a script — OUTSIDE the configured tree — so every start/finish
+    # line would be silently dropped, leaving a long-running production
+    # worker with no lifecycle visibility in its logs.
+    logger = logging.getLogger("commons_core.scripts.run_worker")
     logger.info(
-        "worker starting mode=%s database=%s lease_seconds=%s task_timeout_seconds=%s",
+        "worker starting mode=%s database=%s lease_seconds=%s task_timeout_seconds=%s "
+        "task_cap=%s idle_sleep=%s",
         "once" if args.once else "loop",
         "configured",
         args.lease_seconds,
         settings.task_timeout_seconds,
+        "unlimited" if args.max_tasks is None else args.max_tasks,
+        args.idle_sleep,
     )
     try:
         processed = run_worker(

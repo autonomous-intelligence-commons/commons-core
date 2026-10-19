@@ -139,6 +139,15 @@ scripts/run_worker.py [--once | --loop]
          SIGTERM/SIGINT → stop flag between iterations (in-flight task completes)
 ```
 
+Lifetime semantics: `--loop` has NO default task cap — it runs until a
+shutdown signal or fatal failure and stays alive (idle, 1.0s poll) while
+no tasks are due or the emergency stop is engaged. An explicit positive
+`--max-tasks N` bounds a loop run (tests / scripted batches); `--once`
+processes at most one task; both flags plus invalid limits are rejected.
+Idle polls sleep interruptibly (the stop event wakes the loop immediately,
+so SIGTERM latency is one in-flight task, not the idle sleep; new-task
+pickup latency is bounded by one idle sleep).
+
 ### 3.3 Admin plane
 
 ```
@@ -153,7 +162,7 @@ scripts/manage.py (CLI, direct DB)   /api/v1/admin/* (HTTP, admin capability)
 | Database | (SQLite file, or PostgreSQL service in compose/Railway) | — |
 | Migrations | `alembic upgrade head` (env reads `AIC_DATABASE_URL`) | DB up |
 | API | `uvicorn commons_core.api.app:app --host 0.0.0.0 --port $PORT` (Railway) or `python -m commons_core` (dev) | migrations applied |
-| Worker | `python scripts/run_worker.py --loop` | migrations applied |
+| Worker | `python scripts/run_worker.py --loop` (unlimited by default; `--max-tasks N` for bounded batches) | migrations applied |
 
 Startup order: **postgres → migrate → api + worker** (see
 `docs/DEPLOYMENT.md` §Railway). The worker never serves HTTP; the API never

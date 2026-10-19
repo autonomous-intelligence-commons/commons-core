@@ -1,12 +1,12 @@
 # Railway Secure Deployment Runbook — AIC Phase 1
 
-> **Status: PREPARED, NOT DEPLOYED.** Nothing in this document was executed
-> against Railway — it is the deployment-ready configuration for user review
-> before any service is started (per the Railway Secure Deployment
-> Preparation spec). All platform behaviors marked **[assumed]** are based on
-> Railway's public documentation and MUST be confirmed in the dashboard at
-> deploy time. Everything marked **[verified]** was executed locally against
-> a real PostgreSQL 18.3 server with the exact repository code.
+> **Status: DEPLOYED 2026-10-19** (milestone record: `docs/milestones/2026-10-19-phase-1.md`).
+> The original runbook below was prepared, reviewed, then executed; both
+> production smoke tests (`noop`, `heartbeat`) passed and the synthetic test
+> agent was revoked afterwards. Sections originally written as
+> **[assumed]** have since been confirmed by the live deployment where the
+> milestone record says so. Everything marked **[verified]** was executed
+> locally against a real PostgreSQL server with the exact repository code.
 
 ## 0. What changed in this branch (and why)
 
@@ -17,6 +17,39 @@ fixed with the smallest secure correction:
 |---|---|---|---|
 | 1 | Railway's `${{Postgres.DATABASE_URL}}` uses the bare `postgresql://` scheme. SQLAlchemy maps that to the **psycopg2** dialect — the image ships only psycopg 3, so API/worker/migrate would all crash at engine creation (`ModuleNotFoundError`). | `Settings.database_url` field validator rewrites bare `postgresql://` / `postgres://` to `postgresql+psycopg://` (rest of the URL preserved byte-for-byte; explicit dialect suffixes and SQLite untouched). | **[verified]** end-to-end on PG 18.3: alembic, production app factory, authenticated round-trip, worker task. |
 | 2 | Railway-generated PostgreSQL passwords contain special characters, so the injected URL carries **percent-encoded userinfo** (`%40` etc.). `migrations/env.py` passed the URL to `alembic`'s ConfigParser-based config, which treats `%` as interpolation syntax → `ValueError: invalid interpolation syntax` → the migration step dies before any service starts. | `migrations/env.py` escapes `%` → `%%` before `set_main_option` (alembic FAQ pattern; offline mode reads the unescaped value back). | **[verified]** on PG 18.3 with a percent-encoded special-character password. |
+
+### 0.1 Worker lifetime hardening (post-deployment follow-up)
+
+After the first deploy, the worker reliability audit found a THIRD defect
+in the same class: `scripts/run_worker.py` carried a hidden **default
+`--max-tasks 100`**, so the documented Railway start command
+`python scripts/run_worker.py --loop --lease-seconds 90` silently EXITED
+after processing 100 tasks (Railway's restart-on-exit then relaunched it —
+noisy, and each restart lost the "continuously running scheduler"
+semantics). Fixed in the worker-lifetime hardening PR:
+
+- `--loop` now defaults to **unlimited tasks** (type-safe `None` sentinel);
+  the loop runs until SIGTERM/SIGINT or a fatal failure, staying alive
+  while idle or paused (emergency stop).
+- `--max-tasks N` remains an explicit, positive, loop-only bound for tests
+  and scripted batches; invalid values (0/negative) and the contradictory
+  `--once --max-tasks` combination are REJECTED with a clean usage error.
+- Idle polling default raised `0.05s → 1.0s` (20x fewer idle DB queries;
+  shutdown stays responsive — the stop event interrupts the idle wait —
+  and new-task pickup latency is bounded by one idle sleep).
+- CLI `--lease-seconds` default `30 → 90` (the old default was incoherent
+  with the default `AIC_TASK_TIMEOUT_SECONDS=30` — the worker refused to
+  start with all-default arguments; 90 matches the production command).
+- Worker lifecycle logging fixed: the CLI's start/finish lines now flow
+  through the configured `commons_core` logger tree (previously dropped —
+  a script-run `__main__` logger had no handler, so Railway logs showed
+  NO worker lifecycle lines).
+
+**The Railway start command stays EXACTLY as documented:
+`python scripts/run_worker.py --loop --lease-seconds 90`** — after the fix
+its meaning simply becomes "run forever until stopped", which was always
+the intent. No environment variable, domain, or infrastructure change is
+required.
 
 No security control was weakened: fail-closed production startup, key
 validation, port isolation and rate limits are untouched (full suite green —
@@ -95,7 +128,7 @@ tests in `tests/security/test_production_key_management.py`.
 | Domain / port | **NONE — do not generate a domain.** The worker serves no HTTP; with no domain, Railway exposes nothing publicly. |
 | Variables | `AIC_DATABASE_URL`, `AIC_ENV=production` only. **No `AIC_MASTER_KEYS`** (least privilege, by design). |
 | Health | No HTTP healthcheck (by design — spec §16). Railway marks it healthy when the process stays up. |
-| Preserved semantics | task leasing (`--lease-seconds 90` > `AIC_TASK_TIMEOUT_SECONDS=30` — the worker refuses to start otherwise), per-agent rate limits, durable quotas, emergency stop (worker idles while the stop is engaged), graceful SIGTERM (in-flight task completes before exit). |
+| Preserved semantics | task leasing (`--lease-seconds 90` > `AIC_TASK_TIMEOUT_SECONDS=30` — the worker refuses to start otherwise), per-agent rate limits, durable quotas, emergency stop (worker idles while the stop is engaged), graceful SIGTERM (in-flight task completes before exit). **UNLIMITED task lifetime**: `--loop` runs until a shutdown signal (no default task cap); `--max-tasks` is an explicit loop-only bound; idle poll = 1.0s (see §0.1). |
 
 ## 5. Migration: `alembic upgrade head` exactly once
 
@@ -172,7 +205,7 @@ dashboard's usage panel** (pricing changes; do not treat these as quotes):
 | Item | Estimate | Basis |
 |---|---|---|
 | `commons-api` | ~120–200 MB RAM, ~0.05 vCPU avg | uvicorn + FastAPI + SQLAlchemy pool; smoke-level traffic **[assumed]** |
-| `commons-worker` | ~80–150 MB RAM, ~0.01 vCPU idle | single-threaded poll loop (0.05s idle sleep), bursts on tasks |
+| `commons-worker` | ~80–150 MB RAM, ~0.01 vCPU idle | single-threaded poll loop (1.0s idle poll between DB queries), bursts on tasks |
 | `Postgres` (Railway-managed) | ~150–300 MB RAM | small schema, low write volume **[assumed]** |
 | Egress | negligible at this scale | content-free API responses |
 | **Total** | ~0.35–0.65 GB-equivalent RAM + trivial CPU | at Railway's published ~US$10/GB-RAM/month rate → roughly **US$4–7/month** → the US$5 Trial credit lasts on the order of **~1 month** of 24/7 runtime |
@@ -188,7 +221,17 @@ quotas (env vars), not instance size (docs/DEPLOYMENT.md §2).
 ## 8. Local verification performed (this branch)
 
 All on the REAL repository code; **PostgreSQL 18.3** server (matches
-Railway's major version — NOT inferred from PG 16):
+Railway's major version — NOT inferred from PG 16) — this section records
+the Railway-readiness audit. The worker-lifetime hardening follow-up
+re-ran the full suite on **PostgreSQL 16.2** (mirroring the CI postgres
+job): **415 passed / 2 skipped**, and on SQLite (default):
+**407 passed / 10 skipped** — including 21 new worker-lifetime tests
+(unlimited >100-task loop, explicit cap, `--once`, graceful shutdown,
+idle/pause liveness, idle pickup latency, argument guards, and a real
+subprocess run of the exact Railway start command through SIGTERM).
+Zero regressions vs. the deployment baseline (386/10 SQLite, 394/2 PG).
+
+Original Railway-readiness audit results:
 
 - Full test suite against PG 18.3: **394 passed / 2 skipped** (fail-loud
   backend guard; no SQLite fallback).
@@ -243,9 +286,11 @@ Railway's major version — NOT inferred from PG 16):
 13. Variables: `AIC_DATABASE_URL` = `${{Postgres.DATABASE_URL}}`, `AIC_ENV` = `production`. **No keys. No domain. No pre-deploy command.**
 14. Settings → **Start command override** (or "Custom start command"):
     `python scripts/run_worker.py --loop --lease-seconds 90`
-15. Deploy. Verify: service stays Up (no HTTP), logs show the worker loop;
-    submit a `noop` task via the API (authenticated `POST /api/v1/tasks`)
-    and watch it reach `succeeded` in `GET /api/v1/tasks`.
+15. Deploy. Verify: service stays Up (no HTTP), logs show the worker loop
+    (the `commons_core.scripts.run_worker` start line includes
+    `task_cap=unlimited`); submit a `noop` task via the API (authenticated
+    `POST /api/v1/tasks`) and watch it reach `succeeded` in
+    `GET /api/v1/tasks`.
 16. Confirm the worker has NO domain: Settings → Networking shows none.
 
 **Operational checks after first deploy:**
