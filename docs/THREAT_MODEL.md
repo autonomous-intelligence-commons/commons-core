@@ -474,3 +474,24 @@ PostgreSQL execution — see TESTING.md §6 for the executed evidence):
   while old encrypted backups exist (documented, not solvable by
   immutability). See `docs/BACKUP.md` (threat model §6, deletion limits
   §8) and `docs/ADR/0009-*`.
+- **Recovery-key custody (ADR-0010, Stage 2):** offline recovery-key
+  custody packages — public metadata plus an age-encrypted secrets
+  section holding the age identities and the `AIC_MASTER_KEYS` ring —
+  are now implemented, with two byte-identical offline copies, custody
+  identities stored separately from all copies, an independently
+  recorded SHA-256 trust anchor, and content-blind verification
+  tooling. A 16-step synthetic disaster-recovery exercise (CI, real
+  PostgreSQL 18.6 + age) proves recovery after total infrastructure
+  loss, closing the Stage 1 residual "the age identity has no two-copy
+  offline escrow yet" at the tooling level. The full 17-scenario
+  custody threat table (loss, theft, corruption, compromise, malicious
+  rollback, custodian unavailability, …) lives in
+  `docs/RECOVERY_KEYS.md` §16. Residual (honest): physical custody
+  discipline is a human procedure — the tooling verifies and refuses
+  bad states but cannot enforce where the owner stores copies and
+  identities; custody identities have **no cryptographic
+  misuse-audit trail** (detection is procedural: inventory, anchor
+  verification, periodic drills); rotation never revokes old archives —
+  retained backups stay decryptable by their own identities until
+  retention-aware destruction (`docs/RECOVERY_KEYS.md` §11/§14). See
+  `docs/ADR/0010-offline-recovery-key-custody.md`.

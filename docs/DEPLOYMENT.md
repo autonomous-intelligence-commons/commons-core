@@ -132,6 +132,15 @@ drain access per platform best practice. `AIC_LOG_LEVEL=INFO` recommended.
   **disposable** target first; pointing production back at the restored
   data is a manual, separately reviewed procedure (there is deliberately
   no automatic production restore command).
+- **Stage 2 adds offline recovery-key custody packages** (ADR-0010):
+  repository tooling and a runbook for generating, duplicating,
+  verifying, and (in a disaster) unlocking offline copies of the age
+  identities and `AIC_MASTER_KEYS` — see `docs/RECOVERY_KEYS.md`. The
+  synthetic disaster-recovery exercise (total infrastructure loss →
+  recovery from two offline package copies) runs in CI; real key
+  generation is an owner-gated, offline action. A production restore
+  remains manual and owner-authorized — the Stage 1 boundary is
+  unchanged.
 
 ## 7. Key rotation procedure
 
