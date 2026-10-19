@@ -15,7 +15,9 @@ here is deliberately paranoid:
   allowlisting" the review asked for; the railway-ish host check below is
   only an additional heuristic.
 * URLs are never echoed: error messages use :func:`describe_url`, which
-  masks credentials.
+  drops the username, password, and query string entirely — only the
+  scheme, host, port, and database name remain (operational context
+  without any identity material).
 
 Heuristic limitations (documented honestly, per the review):
 
@@ -47,7 +49,8 @@ class UnsafeDestinationError(RuntimeError):
 
 @dataclass(frozen=True)
 class DestinationTarget:
-    """A validated restore destination (credentials stripped)."""
+    """A validated restore destination (password stripped; keep ``user`` out
+    of rendered output — see :func:`describe_url`)."""
 
     host: str
     port: int
@@ -56,25 +59,25 @@ class DestinationTarget:
     is_nonlocal: bool
 
     def describe(self) -> str:
-        return f"{self.user or 'postgres'}@{self.host}:{self.port}/{self.database_name}"
+        """Credential-free rendering: never includes the username."""
+        return f"{self.host}:{self.port}/{self.database_name}"
 
 
 def describe_url(url: str) -> str:
     """A credential-free description of a database URL for logs/errors.
 
-    The password and query string are dropped entirely — never masked with
-    a reversible scheme, simply not included.
+    The username, password, and query string are dropped entirely — never
+    masked with a reversible scheme, simply not included. What remains is
+    operational context only (scheme, host, port, database name): no
+    identity material of any kind reaches operational output, under either
+    accepted scheme spelling (``postgresql`` or ``postgresql+psycopg`` —
+    the bare scheme prefix of the description is NOT a credential leak).
     """
     parts = urlsplit(url)
-    user = parts.username or ""
     host = parts.hostname or "unknown-host"
     port = f":{parts.port}" if parts.port else ""
     db = parts.path.lstrip("/") or "?"
-    return (
-        f"{parts.scheme or 'postgresql'}://{user}@{host}{port}/{db}"
-        if user
-        else (f"{parts.scheme or 'postgresql'}://{host}{port}/{db}")
-    )
+    return f"{parts.scheme or 'postgresql'}://{host}{port}/{db}"
 
 
 def _host_is_local(host: str) -> bool:

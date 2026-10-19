@@ -240,11 +240,22 @@ def _stream_decrypt_restore(
         for thread in threads:
             thread.join(timeout=5)
 
+        # Hand the target URL's libpq credentials to the scrubber: neither
+        # the password nor the USERNAME may survive in failure detail text
+        # (PostgreSQL's own errors echo the role name).
+        _target = urlsplit(target_url)
+        known_credentials = (
+            unquote(_target.password or ""),
+            unquote(_target.username or ""),
+        )
+
         if age_rc != 0:
-            detail = scrub_secrets("".join(age_err[-6:]).strip())
+            detail = scrub_secrets("".join(age_err[-6:]).strip(), extra_secrets=known_credentials)
             return False, f"age decrypt failed with status {age_rc}: {detail or '(no stderr)'}"
         if restore_rc != 0:
-            detail = scrub_secrets("".join(restore_err[-10:]).strip())
+            detail = scrub_secrets(
+                "".join(restore_err[-10:]).strip(), extra_secrets=known_credentials
+            )
             return False, (
                 f"pg_restore failed with status {restore_rc} (objects created before "
                 f"the failure are destroyed with the dropped database): "

@@ -133,8 +133,11 @@ Fail-closed gates, in order:
      (`aic_test_*`, `aic_drill_*`, `aic_backup_*`, …) or be explicitly
      allowlisted with `--allow-db NAME` — the "explicit test-environment
      allowlisting" the review required, layered on top of the host checks;
-   * URLs are never echoed — errors use `describe_url`, which drops
-     credentials entirely.
+   * URLs are never echoed — errors use `describe_url`, which drops the
+     username, password, and query string entirely (scheme/host/port/
+     database only, under both `postgresql://` and `postgresql+psycopg://`
+     spellings); tool stderr is scrubbed of the run's libpq username and
+     password before it can appear in any failure detail.
    * **Heuristic limitations (documented honestly):** a private-IP
      production database would pass the host check — the disposable-NAME
      allowlist is the real gate; host heuristics are defense-in-depth,
