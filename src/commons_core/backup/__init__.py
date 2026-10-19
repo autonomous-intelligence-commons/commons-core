@@ -1,0 +1,81 @@
+"""AIC backup & recovery — Stage 1 repository-side tooling (ADR-0009).
+
+Scope (everything else stays designed-but-unimplemented — see
+``docs/BACKUP.md`` for the Stage 1 vs future boundary):
+
+* :func:`~commons_core.backup.pipeline.run_backup` — streaming
+  ``pg_dump --format=custom`` piped through ``age`` public-key encryption
+  with explicit process supervision: no plaintext dump file ever exists,
+  failures of either subprocess delete the staged artifact and publish
+  nothing (review correction 1).
+* :mod:`~commons_core.backup.manifest` — the authoritative, non-sensitive
+  backup manifest with documented consistency semantics; no row counts
+  (correction 2).
+* :mod:`~commons_core.backup.storage` — verified, atomic, conflict-safe
+  publication with a commit marker as the ONLY success signal
+  (correction 3), implemented over the local filesystem for Stage 1.
+* :func:`~commons_core.backup.restore.run_restore_drill` — fail-closed
+  synthetic restore into a disposable database with a content-blind
+  application-level verification battery (correction-informed restore
+  safety). There is intentionally NO production restore command.
+
+Key hygiene (correction 6): this package never accepts private key
+material; test identities are generated at runtime and scoped to temporary
+directories; logs are scrubbed of credentials (see
+:func:`~commons_core.backup.destination.scrub_secrets`).
+"""
+
+from .destination import (
+    UnsafeDestinationError,
+    describe_url,
+    scrub_secrets,
+    validate_restore_destination,
+)
+from .manifest import BackupManifest, new_backup_id
+from .pipeline import (
+    ArtifactVerificationFailed,
+    BackupError,
+    BackupOutcome,
+    DumpFailed,
+    EncryptionFailed,
+    PreflightError,
+    run_backup,
+)
+from .restore import DrillFailure, DrillReport, run_restore_drill, verify_restored_database
+from .storage import (
+    BackupConflictError,
+    LocalFilesystemStorage,
+    MissingBackupObject,
+    StorageError,
+)
+from .tools import Toolbelt, ToolError, locate_toolbelt
+
+__all__ = [
+    # backup side
+    "ArtifactVerificationFailed",
+    "BackupConflictError",
+    "BackupError",
+    "BackupManifest",
+    "BackupOutcome",
+    "DumpFailed",
+    "EncryptionFailed",
+    "LocalFilesystemStorage",
+    "MissingBackupObject",
+    "PreflightError",
+    "StorageError",
+    "Toolbelt",
+    "ToolError",
+    "locate_toolbelt",
+    "new_backup_id",
+    "run_backup",
+    # restore side
+    "DrillFailure",
+    "DrillReport",
+    "run_restore_drill",
+    "verify_restored_database",
+    # safety helpers
+    "UnsafeDestinationError",
+    "describe_url",
+    "scrub_secrets",
+    "validate_restore_destination",
+]
