@@ -575,13 +575,13 @@ def test_no_private_keys_in_tracked_files():
     """Scan every tracked file for real age identities / PEM private keys.
 
     The patterns are deliberately STRICT — they match actual key material
-    (a base32 body, a complete PEM header), not documentation that merely
+    (a bech32 body (data part may contain 0-9), a complete PEM header), not documentation that merely
     describes the format. Documentation legitimately contains strings
     like ``AGE-SECRET-KEY-1…``; a committed key never would.
     """
     import re
 
-    age_identity_re = re.compile(r"AGE-SECRET-KEY-1[A-Z2-7]{10,}")
+    age_identity_re = re.compile(r"AGE-SECRET-KEY-1[A-Z0-9]{10,}")  # bech32 data part (0-9 allowed)
     pem_private_re = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
     proc = subprocess.run(
         ["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
