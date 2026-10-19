@@ -156,6 +156,10 @@ class ManifestBuildInputs:
     artifact_sha256: str
     artifact_size: int
     artifact_filename: str
+    # Additive (schema stays 1): extra public recipients the artifact was
+    # encrypted to. Defaults keep pre-Stage-2 callers unchanged; must stay
+    # LAST — Python dataclasses forbid non-default fields after a default.
+    extra_recipients: tuple[str, ...] = ()
 
 
 def build_manifest(inputs: ManifestBuildInputs) -> BackupManifest:
@@ -178,6 +182,7 @@ def build_manifest(inputs: ManifestBuildInputs) -> BackupManifest:
             "size_bytes": inputs.artifact_size,
             "encryption": "age-v1 X25519+ChaCha20-Poly1305 (AEAD)",
             "recipient": inputs.recipient,
+            "recipients": (inputs.recipient, *inputs.extra_recipients),
         },
         retention_class="daily",
         state="verified-published",

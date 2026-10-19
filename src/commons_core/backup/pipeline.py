@@ -39,6 +39,7 @@ import os
 import signal
 import subprocess
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -196,17 +197,24 @@ def _stream_dump_to_age(
     *,
     belt: Toolbelt,
     pg_env: dict[str, str],
-    recipient: str,
+    recipients: Sequence[str],
     staged_artifact: Path,
 ) -> None:
-    """Run ``pg_dump --format=custom | age -r RECIPIENT`` under supervision.
+    """Run ``pg_dump --format=custom | age -r RECIPIENT…`` under supervision.
+
+    The dump is encrypted to every recipient in *recipients* (multiple
+    ``-r`` flags — age's native multi-recipient support), so any one of
+    their identities can decrypt the artifact later.
 
     Raises :class:`DumpFailed` / :class:`EncryptionFailed` on any subprocess
     problem, and guarantees that ``staged_artifact`` is removed on failure
     (partial encrypted output must never survive).
     """
     dump_argv = [belt.pg_dump, "--format=custom"]
-    age_argv = [belt.age, "-r", recipient, "-o", str(staged_artifact)]
+    age_argv = [belt.age]
+    for one_recipient in recipients:
+        age_argv.extend(["-r", one_recipient])
+    age_argv.extend(["-o", str(staged_artifact)])
 
     dump_proc = age_proc = None
     dump_err: list[str] = []
@@ -304,6 +312,7 @@ def run_backup(
     work_dir: str | os.PathLike,
     toolbelt: Toolbelt | None = None,
     backup_id: str | None = None,
+    extra_recipients: Sequence[str] = (),
 ) -> BackupOutcome:
     """Execute one full backup: dump → encrypt → verify → publish → confirm.
 
@@ -322,6 +331,17 @@ def run_backup(
             "age recipient must be a public age1… key (private identities are never "
             "accepted by the backup path)"
         )
+
+    recipients: list[str] = [recipient]
+    for extra in extra_recipients:
+        extra = extra.strip()
+        if not extra.startswith("age1"):
+            raise PreflightError(
+                "extra age recipients must be public age1… keys (private "
+                "identities are never accepted by the backup path)"
+            )
+        if extra not in recipients:
+            recipients.append(extra)
 
     belt = toolbelt or locate_toolbelt()
     backup_id = backup_id or new_backup_id()
@@ -347,7 +367,7 @@ def run_backup(
     _stream_dump_to_age(
         belt=belt,
         pg_env=pg_env,
-        recipient=recipient,
+        recipients=recipients,
         staged_artifact=staged,
     )
 
@@ -374,7 +394,8 @@ def run_backup(
             database_name=source_meta["database_name"],
             alembic_revision=alembic_revision,
             tool_versions=belt.version_info(),
-            recipient=recipient,
+            recipient=recipients[0],
+            extra_recipients=tuple(recipients[1:]),
             artifact_sha256=artifact_sha256,
             artifact_size=artifact_size,
             artifact_filename=f"{backup_id}.age",

@@ -23,6 +23,10 @@ Key hygiene (correction 6): this package never accepts private key
 material; test identities are generated at runtime and scoped to temporary
 directories; logs are scrubbed of credentials (see
 :func:`~commons_core.backup.destination.scrub_secrets`).
+
+Stage 2 adds :mod:`~commons_core.backup.recovery_keys` — offline recovery-key
+custody packages (ADR-0010): two-copy redundancy, content-blind verification,
+and exports for disaster recovery, with the same never-a-secret-in-argv rules.
 """
 
 from .destination import (
@@ -40,6 +44,24 @@ from .pipeline import (
     EncryptionFailed,
     PreflightError,
     run_backup,
+)
+from .recovery_keys import (
+    AgeIdentity,
+    PackageCreated,
+    PackageExistsError,
+    PackageFormatError,
+    PackageVerificationError,
+    RecoveryKeyError,
+    UnsafeOutputError,
+    VerificationReport,
+    create_recovery_package,
+    duplicate_recovery_package,
+    export_age_identity,
+    export_application_env,
+    generate_age_identity,
+    read_age_identity_file,
+    unlock_recovery_package,
+    verify_recovery_package,
 )
 from .restore import DrillFailure, DrillReport, run_restore_drill, verify_restored_database
 from .storage import (
@@ -78,4 +100,21 @@ __all__ = [
     "describe_url",
     "scrub_secrets",
     "validate_restore_destination",
+    # recovery custody (Stage 2)
+    "AgeIdentity",
+    "PackageCreated",
+    "PackageExistsError",
+    "PackageFormatError",
+    "PackageVerificationError",
+    "RecoveryKeyError",
+    "UnsafeOutputError",
+    "VerificationReport",
+    "create_recovery_package",
+    "duplicate_recovery_package",
+    "export_age_identity",
+    "export_application_env",
+    "generate_age_identity",
+    "read_age_identity_file",
+    "unlock_recovery_package",
+    "verify_recovery_package",
 ]
