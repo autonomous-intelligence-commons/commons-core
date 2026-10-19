@@ -32,9 +32,16 @@ concurrent claim of the same task.
 Graceful shutdown: SIGTERM/SIGINT (main thread, loop mode) set a stop flag;
 the loop checks the flag only BETWEEN iterations, so an in-flight task
 completes before the worker exits. ``once=True`` processes at most one task
-— the mode used by tests and scripted operation. ``max_tasks`` bounds a
-loop run. Idle iterations sleep ``idle_sleep`` seconds (interruptibly via
-the stop event when provided).
+— the mode used by tests and scripted operation. ``max_tasks`` is an
+OPTIONAL explicit bound for loop runs: ``None`` (the default) means NO
+lifetime task cap — the loop runs until a shutdown signal (or fatal
+failure), which is the intended semantics for a continuously running
+service (Railway worker). An explicit ``max_tasks`` must be a positive
+integer and is only valid in loop mode (``--once`` is already bounded to
+one task); invalid values are rejected, never silently accepted.
+Idle iterations sleep ``idle_sleep`` seconds (default 1.0 — one database
+poll per second while idle; interruptible via the stop event when
+provided, so shutdown responsiveness is preserved).
 
 All timestamps come from an injectable ``clock`` callable (tests advance
 time deterministically — no real sleeps).
@@ -98,9 +105,9 @@ def run_worker(
     session_factory: SessionFactory,
     *,
     once: bool = False,
-    max_tasks: int = 100,
+    max_tasks: int | None = None,
     lease_seconds: int = 30,
-    idle_sleep: float = 0.05,
+    idle_sleep: float = 1.0,
     task_timeout_seconds: float = 0.0,
     clock: Clock | None = None,
     stop_event: threading.Event | None = None,
@@ -112,14 +119,38 @@ def run_worker(
     is injectable for deterministic tests. ``once=True`` processes at most
     ONE task and exits (also cleanly under an active emergency stop).
 
+    ``max_tasks`` — explicit lifetime cap for loop runs, or ``None`` for
+    UNLIMITED (the default): loop mode then runs until a shutdown signal
+    or fatal failure, staying alive (and idle) while no eligible tasks
+    exist. Type-safe sentinel: ``None`` means "no cap"; any explicit value
+    must be a positive integer (``>= 1``) and is valid in loop mode ONLY —
+    combining it with ``once=True`` is rejected, because ``--once`` is
+    already bounded to one task (fail-closed on contradictory config).
+
     ``task_timeout_seconds`` (from ``AIC_TASK_TIMEOUT_SECONDS``): when > 0,
     each handler execution gets that wall-clock budget (guarded thread;
     timeout → retry/backoff). The worker refuses to start unless
     ``lease_seconds > task_timeout_seconds`` (coherent claim/timeout
     semantics — see the module docstring).
+
+    ``idle_sleep`` — seconds slept between idle polls (default ``1.0``:
+    one database poll per second while idle keeps a continuously running
+    service off a high-frequency query path). The wait is interruptible
+    via ``stop_event`` (SIGTERM wakes the loop immediately), so worst-case
+    shutdown latency is one in-flight task, not the idle sleep; worst-case
+    NEW-task pickup latency is one ``idle_sleep``. Must be ``>= 0``.
     """
-    if max_tasks < 1:
-        raise ValueError("max_tasks must be >= 1")
+    if max_tasks is not None and max_tasks < 1:
+        raise ValueError(
+            f"max_tasks must be a positive integer (>= 1) or None for unlimited (got {max_tasks})"
+        )
+    if once and max_tasks is not None:
+        raise ValueError(
+            "max_tasks is a loop-mode bound only: once=True already processes "
+            f"at most one task (got max_tasks={max_tasks})"
+        )
+    if idle_sleep < 0:
+        raise ValueError(f"idle_sleep must be >= 0 (got {idle_sleep})")
     if task_timeout_seconds > 0 and lease_seconds <= task_timeout_seconds:
         raise ValueError(
             "lease_seconds must EXCEED task_timeout_seconds "
@@ -180,7 +211,9 @@ def run_worker(
                 )
 
         processed += 1
-        if once or processed >= max_tasks:
+        if once:
+            break
+        if max_tasks is not None and processed >= max_tasks:
             break
     return processed
 

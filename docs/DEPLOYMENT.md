@@ -44,7 +44,7 @@ Project (already existing per spec §1): `autonomous-intelligence-commons`.
 | `commons-postgres` | Railway PostgreSQL plugin | PRIVATE network only. Railway exposes `DATABASE_URL` / `DATABASE_PRIVATE_URL` — map the private one into `AIC_DATABASE_URL`. **Do not expose a public port.** |
 | `commons-migrate` | `alembic upgrade head` | One-shot job, runs BEFORE api/worker start (see §3 sequencing). Can be run as a Railway "command" service that exits, or manually from a shell with the variables set. |
 | `commons-api` | `uvicorn commons_core.api.app:app --host 0.0.0.0 --port $PORT` | The only service needing a public (TLS-terminated) endpoint. |
-| `commons-worker` | `python scripts/run_worker.py --loop` | Private; no public endpoint; handles SIGTERM gracefully. |
+| `commons-worker` | `python scripts/run_worker.py --loop` | Private; no public endpoint; handles SIGTERM gracefully. UNLIMITED task lifetime by default (explicit `--max-tasks N` bounds a run for tests/batches); idle poll 1.0s. |
 
 ### Private networking caveat (spec §18 — documented limitation)
 
@@ -168,7 +168,7 @@ Services in `compose.yaml`:
 | `postgres` | `postgres:16-alpine` with `pg_isready` healthcheck and a named volume; credentials from `.env` |
 | `migrate` | one-shot `alembic upgrade head`; depends on postgres being healthy |
 | `api` | uvicorn app on port 8010 (the ONLY host-published port); depends on migrate completing successfully |
-| `worker` | `python scripts/run_worker.py --loop`; depends on migrate; no host port |
+| `worker` | `python scripts/run_worker.py --loop` (unlimited task lifetime by default); depends on migrate; no host port |
 
 Commands (on a Docker machine):
 
