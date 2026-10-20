@@ -39,6 +39,7 @@ import os
 import signal
 import subprocess
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -187,26 +188,44 @@ def _source_metadata(database_url: str) -> tuple[dict, str | None, int]:
         ) from exc
 
 
-def _describe_sigpipe(stage_stderr: list[str]) -> str:
+def _describe_sigpipe(stage_stderr: list[str], extra_secrets: Sequence[str] = ()) -> str:
+    """Scrub a subprocess's captured stderr for error messages.
+
+    ``extra_secrets`` carries the run's libpq credentials (PGPASSWORD,
+    PGUSER): PostgreSQL's own failure text can legitimately echo the
+    USERNAME (e.g. ``FATAL: password authentication failed for user …``),
+    and usernames are exactly as barred from operational output as
+    passwords are — both are redacted here.
+    """
     joined = "".join(stage_stderr[-8:]).strip()
-    return scrub_secrets(joined) if joined else "(no stderr captured)"
+    if not joined:
+        return "(no stderr captured)"
+    known = tuple(secret for secret in extra_secrets if secret)
+    return scrub_secrets(joined, extra_secrets=known)
 
 
 def _stream_dump_to_age(
     *,
     belt: Toolbelt,
     pg_env: dict[str, str],
-    recipient: str,
+    recipients: Sequence[str],
     staged_artifact: Path,
 ) -> None:
-    """Run ``pg_dump --format=custom | age -r RECIPIENT`` under supervision.
+    """Run ``pg_dump --format=custom | age -r RECIPIENT…`` under supervision.
+
+    The dump is encrypted to every recipient in *recipients* (multiple
+    ``-r`` flags — age's native multi-recipient support), so any one of
+    their identities can decrypt the artifact later.
 
     Raises :class:`DumpFailed` / :class:`EncryptionFailed` on any subprocess
     problem, and guarantees that ``staged_artifact`` is removed on failure
     (partial encrypted output must never survive).
     """
     dump_argv = [belt.pg_dump, "--format=custom"]
-    age_argv = [belt.age, "-r", recipient, "-o", str(staged_artifact)]
+    age_argv = [belt.age]
+    for one_recipient in recipients:
+        age_argv.extend(["-r", one_recipient])
+    age_argv.extend(["-o", str(staged_artifact)])
 
     dump_proc = age_proc = None
     dump_err: list[str] = []
@@ -237,15 +256,20 @@ def _stream_dump_to_age(
         for thread in threads:
             thread.join(timeout=5)
 
+        # The run's libpq credentials ride to pg_dump via the environment;
+        # the same values are handed to the scrubber so that neither the
+        # password nor the USERNAME can survive in failure detail text.
+        known_credentials = (pg_env.get("PGPASSWORD", ""), pg_env.get("PGUSER", ""))
+
         if dump_rc != 0:
-            detail = _describe_sigpipe(dump_err)
+            detail = _describe_sigpipe(dump_err, known_credentials)
             raise DumpFailed(
                 f"pg_dump failed with status {dump_rc} ("
                 f"{'terminated by SIGPIPE — downstream age process exited prematurely' if dump_rc == -signal.SIGPIPE else 'see scrubbed stderr'}"
                 f"): {detail}"
             )
         if age_rc != 0:
-            detail = _describe_sigpipe(age_err)
+            detail = _describe_sigpipe(age_err, known_credentials)
             raise EncryptionFailed(
                 f"age failed with status {age_rc} after consuming the dump: {detail}"
             )
@@ -304,6 +328,7 @@ def run_backup(
     work_dir: str | os.PathLike,
     toolbelt: Toolbelt | None = None,
     backup_id: str | None = None,
+    extra_recipients: Sequence[str] = (),
 ) -> BackupOutcome:
     """Execute one full backup: dump → encrypt → verify → publish → confirm.
 
@@ -322,6 +347,17 @@ def run_backup(
             "age recipient must be a public age1… key (private identities are never "
             "accepted by the backup path)"
         )
+
+    recipients: list[str] = [recipient]
+    for extra in extra_recipients:
+        extra = extra.strip()
+        if not extra.startswith("age1"):
+            raise PreflightError(
+                "extra age recipients must be public age1… keys (private "
+                "identities are never accepted by the backup path)"
+            )
+        if extra not in recipients:
+            recipients.append(extra)
 
     belt = toolbelt or locate_toolbelt()
     backup_id = backup_id or new_backup_id()
@@ -347,7 +383,7 @@ def run_backup(
     _stream_dump_to_age(
         belt=belt,
         pg_env=pg_env,
-        recipient=recipient,
+        recipients=recipients,
         staged_artifact=staged,
     )
 
@@ -374,7 +410,8 @@ def run_backup(
             database_name=source_meta["database_name"],
             alembic_revision=alembic_revision,
             tool_versions=belt.version_info(),
-            recipient=recipient,
+            recipient=recipients[0],
+            extra_recipients=tuple(recipients[1:]),
             artifact_sha256=artifact_sha256,
             artifact_size=artifact_size,
             artifact_filename=f"{backup_id}.age",

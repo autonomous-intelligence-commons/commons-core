@@ -230,3 +230,7 @@ __marimo__/
 *.dump
 *.backup
 age-identity*.txt
+# Stage 2 recovery custody artifacts (owner-side, never committed)
+*.recovery-metadata.json
+*.recovery-secrets.age
+age-identity-custody-*.txt

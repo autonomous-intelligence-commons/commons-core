@@ -133,8 +133,11 @@ Fail-closed gates, in order:
      (`aic_test_*`, `aic_drill_*`, `aic_backup_*`, …) or be explicitly
      allowlisted with `--allow-db NAME` — the "explicit test-environment
      allowlisting" the review required, layered on top of the host checks;
-   * URLs are never echoed — errors use `describe_url`, which drops
-     credentials entirely.
+   * URLs are never echoed — errors use `describe_url`, which drops the
+     username, password, and query string entirely (scheme/host/port/
+     database only, under both `postgresql://` and `postgresql+psycopg://`
+     spellings); tool stderr is scrubbed of the run's libpq username and
+     password before it can appear in any failure detail.
    * **Heuristic limitations (documented honestly):** a private-IP
      production database would pass the host check — the disposable-NAME
      allowlist is the real gate; host heuristics are defense-in-depth,
@@ -202,6 +205,30 @@ labels, counts, and PASS/FAIL — never content, never credentials.
   `AIC_MASTER_KEYS` leaves dumps restorable but content unreadable (the
   existing `RAILWAY.md` §6 offline-key procedure remains a hard
   precondition of the whole design).
+
+**Stage 2 (ADR-0010) — custody is now specified and tool-supported.**
+The "two-copy offline escrow" mitigation above is no longer future
+work: age identities and the `AIC_MASTER_KEYS` ring are packaged into
+versioned offline **recovery packages** (public metadata JSON + an
+age-encrypted secrets section), duplicated to two byte-identical
+offline copies, and verified by content-blind tooling — see
+[ADR-0010](ADR/0010-offline-recovery-key-custody.md) and the
+[RECOVERY_KEYS.md](RECOVERY_KEYS.md) runbook for the custody
+architecture, the owner-side offline procedures, and the honest
+consequences table (both copies lost ⇒ that generation's secrets are
+gone).
+
+**Dual-recipient backups are implemented (Stage 2).**
+`run_backup(..., extra_recipients=[...])` encrypts each archive to the
+primary recipient *and* the extra public recipients, recording an
+additive `artifact["recipients"]` list in the manifest
+(`schema_version` stays 1; single-recipient manifests keep their exact
+Stage 1 meaning; `recipient` remains the primary). The rotation
+procedure above is therefore executable as a dual-recipient
+**transition window**: run the window with the old recipient as
+primary and the new one as an extra for ≥ the retention horizon, then
+switch — full procedure (including successor custodians) in
+[RECOVERY_KEYS.md](RECOVERY_KEYS.md) §11.
 
 ## 6. Storage roles & threat model (correction 4)
 
@@ -315,6 +342,27 @@ designed:
   production-name destination refusals; explicit allowlist override;
   no plaintext files anywhere; no credentials in CLI output.
 
+`tests/operational/test_recovery_keys.py` — 38 tests (ADR-0010,
+Stage 2): the recovery-key **continuity scenarios 1–11** (single-copy
+loss, both-copy loss, custody-identity loss, K1→K2 continuity,
+recipient rotation, …), package mechanics (create/verify/unlock/
+export/duplicate roundtrip, hygiene, trust anchor, tamper/truncate/
+swap rejection, copy drift, overwrite & unsafe-directory refusal,
+read-only storage, interrupted creation, stateless verify, wrong
+identities, rotation readiness), CLI exit codes, and secret-leak
+scans (no key material in argv, output, or logs).
+
+`tests/operational/test_recovery_dr.py` — the synthetic
+**disaster-recovery exercise** (ADR-0010, Stage 2): 16 steps on real
+PostgreSQL 18.6 + age — total loss of the source database, then
+recovery from two offline package copies + the moved-out custody
+identity + the vault, proving BOTH key generations' memory chains
+decrypt byte-for-byte with the recovered ring — plus the
+**rotation-archives suite**: dual-recipient transition-window backups
+decrypt with either identity, the retired recipient disappears from
+future backups only, and the retained old-recipient archive still
+drills green.
+
 CI (`.github/workflows/ci.yml`):
 
 * The six existing required checks are untouched.
@@ -326,6 +374,11 @@ CI (`.github/workflows/ci.yml`):
   PGDG 18.6 client — the review's PostgreSQL 18 requirement. The job
   fails loudly if any mandatory backup verification fails; there is no
   silent skip and no SQLite fallback.
+* Stage 2 (ADR-0010): the recovery suites also run in CI —
+  `test_recovery_keys.py` and `test_recovery_dr.py` both run in the
+  `backup-postgres18` job (same pinned age + PG 18.6 environment), and
+  the `test_recovery_keys.py` unit suite also runs in the SQLite
+  `test` job with the pinned age binaries.
 * Tool pinning: age v1.3.2 from the official release tarball with its
   SHA-256 pinned (verified byte-identical to the official asset);
   `age --version` is asserted in the job; client tools are version-
@@ -366,9 +419,15 @@ is where the RTO claim would first become a measurement.
 
 ## 12. Stage 2+ dependencies (future, separately authorized)
 
-1. **Stage 2 — custody:** age identity generated offline, two-copy
-   escrow, recipient distributed; `AIC_MASTER_KEYS` offline-copy
-   re-verified (hard precondition).
+1. **Stage 2 — custody: DONE (ADR-0010).** Offline identity generation,
+   two-copy offline escrow (byte-identical, `--compare-dir`-verified),
+   custody-identity distribution/storage rules, and `AIC_MASTER_KEYS`
+   offline-copy packaging + verification are implemented,
+   tool-supported, and synthetically CI-proven — see
+   [ADR-0010](ADR/0010-offline-recovery-key-custody.md) and
+   [RECOVERY_KEYS.md](RECOVERY_KEYS.md). What remains is the
+   off-provider **automated copy** of backup archives (Stage 3 storage
+   work, item 2 below).
 2. **Stage 3 — storage + scheduling:** choose B2/R2, dedicated bucket,
    write-scoped app key, object versioning; S3 `StorageAdapter`
    implementing §2.3's protocol (copy-verify-delete staging, since
