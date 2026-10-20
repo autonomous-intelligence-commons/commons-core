@@ -42,6 +42,11 @@ class TestResumePositive:
         _, bundle = make_bundle(synth, worklog=synth.worklog)
         fresh = synth.root / "fresh"
         git(synth.repo, "clone", "-q", str(synth.bare), str(fresh))
+        # Own synthetic identity for the recovery clone (clean-runner
+        # regression: fresh clones inherit no user.* config and CI runners
+        # have no global one — git am needs a committer identity).
+        git(fresh, "config", "user.name", "Resumed Agent")
+        git(fresh, "config", "user.email", "resumed@example.invalid")
         git(fresh, "checkout", "-q", synth.baseline)
         git(fresh, "switch", "-qc", "feature/test")
         extracted = synth.root / "ckpt"

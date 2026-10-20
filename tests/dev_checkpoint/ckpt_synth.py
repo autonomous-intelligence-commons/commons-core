@@ -36,6 +36,32 @@ RESUME_TOOL = SCRIPTS / "dev_resume_check.py"
 FIXED_CLOCK = "2026-10-20T00:00:00Z"
 
 
+def git_env() -> dict[str, str]:
+    """Subprocess environment for hermetic test-side Git calls.
+
+    The host's global and system Git configuration files are disabled
+    (``GIT_CONFIG_GLOBAL``/``GIT_CONFIG_SYSTEM`` point at the empty device)
+    and any inherited identity environment is stripped, so every call
+    behaves exactly as on a clean CI runner: synthetic ``git commit`` /
+    ``git am`` operations get their identity from the disposable
+    repository's OWN local ``user.*`` configuration (see the ``synth``
+    fixture and the recovery clones), never from the developer's machine.
+    A real user's global Git settings are neither read nor modified.
+    """
+    env = dict(os.environ)
+    for leaked in (
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "EMAIL",
+    ):
+        env.pop(leaked, None)
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
+    return env
+
+
 def run_tool(
     script: Path, *args: str, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -53,8 +79,19 @@ def run_tool(
 
 
 def git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    """Run Git in a hermetic subprocess (clean CI-runner equivalence).
+
+    Identity never comes from the host: config isolation plus stripping of
+    inherited identity variables (see :func:`git_env`) means synthetic
+    ``git commit`` / ``git am`` operations work exactly as on a clean runner
+    — they require (and use) the disposable repository's own local identity.
+    """
     proc = subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=git_env(),
     )
     if check and proc.returncode != 0:
         raise AssertionError(f"git {' '.join(args)} failed: {(proc.stderr or proc.stdout).strip()}")

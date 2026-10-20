@@ -65,6 +65,14 @@ class TestVerifyPositive:
         _, bundle = make_bundle(synth)
         fresh = synth.root / "fresh"
         git(synth.repo, "clone", "-q", str(synth.bare), str(fresh))
+        # Recovery clones carry their OWN synthetic identity — a fresh
+        # clone inherits no user.* config and clean CI runners have no
+        # global one, so git am would fail with "Committer identity
+        # unknown" (the GitHub CI regression).  A distinct identity from
+        # the fixture repo also guarantees the am-produced commits get NEW
+        # SHAs, as the gate's NOTE path expects.
+        git(fresh, "config", "user.name", "Resumed Agent")
+        git(fresh, "config", "user.email", "resumed@example.invalid")
         git(fresh, "checkout", "-q", synth.baseline)
         git(fresh, "switch", "-qc", "feature/test")
         extracted = synth.root / "ckpt"
@@ -311,6 +319,10 @@ class TestVerifyNegative:
         _, bundle = make_bundle(synth)
         fresh = synth.root / "fresh"
         git(synth.repo, "clone", "-q", str(synth.bare), str(fresh))
+        # Own synthetic identity for the recovery clone (clean-runner
+        # regression: no global Git identity exists on CI runners).
+        git(fresh, "config", "user.name", "Resumed Agent")
+        git(fresh, "config", "user.email", "resumed@example.invalid")
         git(fresh, "checkout", "-q", synth.baseline)
         git(fresh, "switch", "-qc", "feature/test")
         extracted = synth.root / "ckpt"
