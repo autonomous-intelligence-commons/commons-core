@@ -504,18 +504,29 @@ PostgreSQL execution — see TESTING.md §6 for the executed evidence):
   Query-string destination overrides (`?host=`, `?hostaddr=`,
   `?service=`, …), duplicate/unknown parameters, hostless (Unix-socket)
   URLs, and inherited `PG*` environment variables can no longer make the
-  validated host and the connected host differ. Residual: this is an
-  *application-layer consistency* guarantee — network isolation and DB
-  role least-privilege remain independent, required controls.
+  validated host and the connected host differ. In-process connections
+  use explicit connect parameters plus a fail-closed inherited-
+  environment audit (no process-global `os.environ` mutation — thread-
+  safe under concurrent in-process use); purely behavioural `PG*`
+  variables (application name, connect timeout, options, encodings,
+  date style, timezone, keepalives) may still be inherited and cannot
+  change destination, credentials, identity or transport security mode
+  (residual review §8). Residual: this is an *application-layer
+  consistency* guarantee — network isolation and DB role
+  least-privilege remain independent, required controls.
 - **Truthless markers no longer bless missing backups (R11/T09):** the
   storage idempotent fast path re-verifies the whole committed object set
   (artifact and manifest hashes against the commit marker) on every
   replay; missing or corrupted sets raise `PublishedSetCorrupted` and the
   immutable backup id is never silently re-blessed. Concurrent same-id
   publications use unique staging names and exclusive-create promotion
-  (POSIX). Residual: a forged-but-internally-consistent storage state is
-  still only detectable by the real age identity at drill time (R13,
-  unchanged).
+  (POSIX); filesystems without hard-link support (exFAT/FAT32, some
+  network mounts) fail safely with `PublicationUnsupportedError` before
+  anything is staged — the destructive `os.replace` fallback was removed
+  because it was last-writer-wins and could silently overwrite a
+  committed backup (residual review §9). Residual: a forged-but-
+  internally-consistent storage state is still only detectable by the
+  real age identity at drill time (R13, unchanged).
 - **Failure cleanup is explicit and bounded (R12/T10/T11):** publication
   failures remove the staged `.part` artifact with an observed outcome;
   `_drop_database` raises instead of swallowing and re-queries

@@ -1,7 +1,9 @@
 # ADR-0011 — P0 Backup & Recovery Security Hardening (R10 / R11 / R12)
 
 **Status:** implemented and synthetically verified (2026-10-19 independent
-remediation of the P0 findings from the comprehensive risk review).
+remediation of the P0 findings from the comprehensive risk review);
+**amended 2026-10-20** by the Stage 2 + P0 integration residual security
+review (§8 process-environment mutation, §9 atomic publication fallback).
 Supersedes no prior decision; hardens ADR-0009 Stage 1 in three places.
 
 **Context.** The independent risk review (evidence probes T09/T10/T11/T12,
@@ -41,9 +43,35 @@ one parse, so validation and execution cannot diverge.
   `PG*` variable stripped** before the canonical values are set, so
   inherited `PGHOST`/`PGSERVICE`/`PGHOSTADDR` can never redirect a
   `pg_dump`/`pg_restore`.
-* The drill and the verification battery run under
-  `scrubbed_pg_environ()` so lazy SQLAlchemy/psycopg connections are
-  equally controlled on the Python side.
+* In-process connections (SQLAlchemy/psycopg) use **explicit connection
+  parameters plus a fail-closed inherited-environment audit** (residual
+  review §8 amendment; replaces the former process-global
+  `scrubbed_pg_environ()` mutation of `os.environ`):
+  * the canonical URL pins `host`/`port`/`database` (mandatory) and
+    `user`/`password`/allowlisted query parameters when present — conninfo
+    always beats the environment for slots it sets, so inherited
+    `PGHOST`/`PGPORT`/`PGDATABASE` (and `PGUSER`/`PGPASSWORD` when the URL
+    carries them) are provably inert;
+  * `audit_in_process_environment()` refuses, before any connection, the
+    variables the URL can never override — `PGHOSTADDR`, `PGSERVICE`,
+    `PGSERVICEFILE`, `PGTARGETSESSIONATTRS`, `PGREQUIRESSL`,
+    `PGSSLMINPROTOCOLVERSION`, `PGSSLMAXPROTOCOLVERSION`,
+    `PGCHANNELBINDING` unconditionally (a service file or `PGHOSTADDR`
+    redirects TCP even when the URL names a host); `PGPASSWORD`/
+    `PGPASSFILE` only when the URL carries no password; `PGUSER` only
+    when the URL carries no user; TLS trust material
+    (`PGSSLCERT`/`PGSSLKEY`/`PGSSLPASSWORD`/`PGSSLROOTCERT`/`PGSSLCRL`/
+    `PGSSLCRLDIR`) only when the URL does not pin the matching parameter;
+  * `psycopg_connect_kwargs()` pins `sslmode` to libpq's documented
+    default (`prefer`) when the URL does not set it, so an inherited
+    `PGSSLMODE` can never downgrade the transport;
+  * no process-global state is ever mutated — concurrent in-process
+    connections from multiple threads are safe by construction (the
+    former scrub was not thread-safe). Behavioural, non-security
+    parameters (`PGAPPNAME`, `PGCONNECT_TIMEOUT`, `PGOPTIONS`,
+    `PGCLIENTENCODING`, `PGDATESTYLE`, `PGTZ`, keepalives) may still be
+    inherited; they cannot change the destination, credentials, identity
+    or transport security mode.
 * **Honest boundary:** this fixes *internal consistency*, not network
   isolation. A loopback/private-IP check is not a security boundary; real
   isolation still requires network controls and least-privilege DB roles
@@ -65,6 +93,19 @@ names with `O_EXCL`, fsync of staged contents, exclusive-create promotion
 (`os.link` — fails `EEXIST`; race losers hash-compare: equal → idempotent,
 different → hard conflict), and directory fsync after promotion
 (best-effort; unsupported platforms documented).
+
+**Residual review §9 amendment — no destructive fallback:** where hard
+links are unavailable (`EPERM`/`EXDEV`/`ENOSYS`; exFAT/FAT32, some network
+mounts) publication now **fails safely** with `PublicationUnsupportedError`
+instead of falling back to `os.replace` (atomic but last-writer-wins — it
+could silently overwrite an already-committed backup). A per-directory
+capability probe (`_verify_publication_support`) runs after the read-only
+idempotent fast path and before anything is staged, so an unsupported
+filesystem aborts publication up front with operator-facing guidance;
+the error is terminal (never retried). Supported storage filesystems are
+those with hard-link support — ext4/xfs/btrfs/zfs/APFS/NTFS. `latest.json`
+remains the one deliberate `os.replace` user: it is a rebuildable index,
+not a committed object.
 
 `latest.json` is demoted to what it really is — a rebuildable index: a
 failed update prints an explicit warning and can never fail a committed,
@@ -108,14 +149,20 @@ warning, not a publication failure.
   working; URLs that used destination overrides were never valid and now
   fail loudly.
 * **Documented limitations (not silently claimed):**
-  * Windows/directory-fsync and hard-link-free filesystems fall back to
-    `os.replace` promotion (atomic, but last-writer-wins between
-    concurrent same-id publishers there); POSIX keeps exclusive-create.
+  * Storage filesystems without hard-link support (exFAT/FAT32, some
+    network mounts) cannot publish NEW backups at all — they fail safely
+    with `PublicationUnsupportedError` before anything is staged (§9
+    amendment). Read-only idempotent replays of already-committed sets
+    still work anywhere.
   * `SIGKILL` of the whole drill process bypasses `finally`; a TTL
     janitor for orphaned `aic_drill_*` databases remains future
     infrastructure work (review recommendation), tracked in BACKUP.md.
   * Process-group kills require POSIX; on Windows only the direct child
     is terminated.
+  * In-process connections may still inherit purely behavioural `PG*`
+    variables (application name, connect timeout, options, encodings,
+    date style, timezone, keepalives) — documented, not destination-,
+    credential- or transport-relevant (§8 amendment).
   * A forged-but-consistent storage state (attacker rewrites artifact,
     manifest AND marker hashes coherently) is still only caught by
     possession of the real age identity at drill time — unchanged
@@ -134,3 +181,12 @@ observability, drop failure propagation, cleanup verdicts, deadline
 termination of SIGTERM-refusing tools, bounded stderr). Full suite green
 against real PostgreSQL 16 and 18.6 with pinned age v1.3.2. See
 BACKUP.md §13 for the operator-facing summary.
+
+The 2026-10-20 residual review added: the §8 in-process environment
+matrix (refusal rules, kwargs pinning, no-mutation proof at engine
+construction, three live-PostgreSQL tests including two-thread
+concurrent connections under hostile pinnable environment) and the §9
+fail-safe publication matrix (probe refusal leaves nothing staged,
+committed sets byte-identical under link-less republication, read-only
+replay without links, mid-publish promotion failure cleans staging,
+non-retried capability error, end-to-end `run_backup` surfacing).
