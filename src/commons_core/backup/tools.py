@@ -26,7 +26,9 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
+import sys
 from dataclasses import dataclass
 
 AGE_VERSION_PIN = "v1.3.2"
@@ -40,6 +42,73 @@ run records the actual version in the manifest for auditability.
 
 class ToolError(RuntimeError):
     """A required external tool is missing or unusable (fail-closed)."""
+
+
+#: Upper bound on captured stderr lines per subprocess (R12: a chatty
+#: tool must not be able to exhaust memory through the reader threads).
+STDERR_MAX_LINES = 256
+
+
+def subprocess_deadline_seconds() -> float:
+    """Total wall-clock seconds one backup/restore subprocess may run (R12).
+
+    Default 900s; overridable through ``AIC_BACKUP_SUBPROCESS_DEADLINE``
+    for fault-injection tests. No subprocess wait in the backup/restore
+    paths is unbounded anymore.
+    """
+    try:
+        return float(os.environ.get("AIC_BACKUP_SUBPROCESS_DEADLINE", "900"))
+    except ValueError:
+        return 900.0
+
+
+def start_new_session_flag() -> bool:
+    """Run each subprocess in its own process group, where supported (R12).
+
+    Process groups let a deadline kill reap the whole tree (pg_dump may
+    spawn helpers); Windows has no process groups, so ``killpg`` is skipped
+    there — a documented platform limitation, not a silent guarantee.
+    """
+    return sys.platform != "win32"
+
+
+def terminate_process_tree(proc: subprocess.Popen, *, label: str) -> str | None:
+    """Bounded, observable termination of one subprocess (R12).
+
+    Graceful SIGTERM to the whole process group first (where supported),
+    a short grace period, then SIGKILL. Returns a diagnostic note when the
+    process could not be reaped even after SIGKILL — never an unbounded
+    wait, never a silent discard of the outcome.
+    """
+    if proc.poll() is not None:
+        return None
+    if start_new_session_flag() and hasattr(os, "killpg"):
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.terminate()
+    else:
+        proc.terminate()
+    try:
+        proc.wait(timeout=5)
+        return None
+    except subprocess.TimeoutExpired:
+        pass
+    if start_new_session_flag() and hasattr(os, "killpg"):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.kill()
+    else:
+        proc.kill()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        return (
+            f"{label} could not be reaped within 10s of SIGKILL — "
+            "process state is unconfirmed; inspect the host"
+        )
+    return None
 
 
 def _resolve(env_var: str, name: str, tools_dir: str | None = None) -> str:

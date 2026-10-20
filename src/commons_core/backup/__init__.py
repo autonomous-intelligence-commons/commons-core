@@ -29,6 +29,12 @@ custody packages (ADR-0010): two-copy redundancy, content-blind verification,
 and exports for disaster recovery, with the same never-a-secret-in-argv rules.
 """
 
+from .connection import (
+    CanonicalConnection,
+    ConnectionContractError,
+    InProcessEnvironmentError,
+    canonical_from_url,
+)
 from .destination import (
     UnsafeDestinationError,
     describe_url,
@@ -40,9 +46,11 @@ from .pipeline import (
     ArtifactVerificationFailed,
     BackupError,
     BackupOutcome,
+    DeadlineExceeded,
     DumpFailed,
     EncryptionFailed,
     PreflightError,
+    PublicationFailed,
     run_backup,
 )
 from .recovery_keys import (
@@ -63,11 +71,19 @@ from .recovery_keys import (
     unlock_recovery_package,
     verify_recovery_package,
 )
-from .restore import DrillFailure, DrillReport, run_restore_drill, verify_restored_database
+from .restore import (
+    DrillCleanupError,
+    DrillFailure,
+    DrillReport,
+    run_restore_drill,
+    verify_restored_database,
+)
 from .storage import (
     BackupConflictError,
     LocalFilesystemStorage,
     MissingBackupObject,
+    PublicationUnsupportedError,
+    PublishedSetCorrupted,
     StorageError,
 )
 from .tools import Toolbelt, ToolError, locate_toolbelt
@@ -79,11 +95,15 @@ __all__ = [
     "BackupError",
     "BackupManifest",
     "BackupOutcome",
+    "DeadlineExceeded",
     "DumpFailed",
     "EncryptionFailed",
     "LocalFilesystemStorage",
     "MissingBackupObject",
     "PreflightError",
+    "PublicationFailed",
+    "PublicationUnsupportedError",
+    "PublishedSetCorrupted",
     "StorageError",
     "Toolbelt",
     "ToolError",
@@ -91,12 +111,17 @@ __all__ = [
     "new_backup_id",
     "run_backup",
     # restore side
+    "DrillCleanupError",
     "DrillFailure",
     "DrillReport",
     "run_restore_drill",
     "verify_restored_database",
     # safety helpers
+    "CanonicalConnection",
+    "ConnectionContractError",
+    "InProcessEnvironmentError",
     "UnsafeDestinationError",
+    "canonical_from_url",
     "describe_url",
     "scrub_secrets",
     "validate_restore_destination",

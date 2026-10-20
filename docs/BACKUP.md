@@ -71,9 +71,14 @@ adapter must implement the same `StorageAdapter` contract):
 3. **never overwrite**: an existing final object with equal bytes makes
    the publish idempotent (retry-safe); different bytes are a hard
    `BackupConflictError` — backup ids are immutable;
-4. promote with `os.replace` — atomic on one POSIX filesystem. **A future
-   object-storage adapter must NOT assume rename atomicity**: it must
-   copy-then-verify-then-delete a staging key instead;
+4. promote with an exclusive-create hard link (`os.link` fails `EEXIST`;
+   race losers hash-compare — equal bytes are idempotent, different bytes
+   a hard `BackupConflictError`). Where the filesystem cannot support
+   hard links (exFAT/FAT32, some network mounts) publication fails safely
+   with `PublicationUnsupportedError` BEFORE anything is staged — it
+   never downgrades to a destructive replace (residual review §9).
+   **A future object-storage adapter must NOT assume rename atomicity**:
+   it must copy-then-verify-then-delete a staging key instead;
 5. only after BOTH objects are verified, write the commit marker
    `status/<backup_id>.json`. **A backup without a marker is not a
    backup** — the restore drill refuses to touch it.
@@ -138,12 +143,29 @@ Fail-closed gates, in order:
      database only, under both `postgresql://` and `postgresql+psycopg://`
      spellings); tool stderr is scrubbed of the run's libpq username and
      password before it can appear in any failure detail.
+   * **Canonical connection contract (ADR-0011 / R10):** the guard parses
+     the URL through the same `CanonicalConnection` parser that builds
+     every effective connection (SQLAlchemy engines, `pg_dump`/
+     `pg_restore` subprocess environments). Query parameters that could
+     redirect the connection (`?host=`, `?hostaddr=`, `?port=`,
+     `?service=`, `?user=`, `?dbname=`, `?options=`, `?passfile=`, …)
+     are rejected with explicit errors, as are duplicate or unknown
+     parameters; hostless URLs (Unix-socket fallback) are refused;
+     in-process connections are built with explicit connect arguments
+     after a fail-closed audit of inherited `PG*` variables (unpinnable
+     redirectors such as `PGHOSTADDR`/`PGSERVICE` abort the drill;
+     `sslmode` is pinned to its documented default when the URL omits
+     it) — no process-global environment mutation, so the validated
+     destination and the effective destination cannot differ through
+     supported configuration paths, even under concurrent in-process
+     use (residual review §8).
    * **Heuristic limitations (documented honestly):** a private-IP
      production database would pass the host check — the disposable-NAME
      allowlist is the real gate; host heuristics are defense-in-depth,
      not proof. Python's `ipaddress` treats some reserved ranges
      (e.g. `203.0.113.0/24`) as private — documented behavior, verified
-     in tests.
+     in tests. No syntactic host/port check constitutes a network
+     boundary: real isolation requires network controls (ADR-0011 D1).
 2. The drill creates a **uniquely named** disposable database
    (`aic_drill_<hex>`), refusing to reuse an existing one, and drops it on
    **every** path (success, failure, crash) unless `--keep-database`
@@ -158,6 +180,16 @@ Fail-closed gates, in order:
 5. A non-zero `pg_restore` exit is a failure even if objects were
    created — they are destroyed with the dropped database.
 6. The application battery (below) must pass for the drill to report PASS.
+7. **Cleanup is reported, not assumed (ADR-0011 / R12):** the drill report
+   carries a dedicated `cleanup_state`/`cleanup_detail` — `dropped` only
+   after `DROP` plus a re-query of `pg_database` confirms the database is
+   gone; a cleanup failure is an explicit `DrillCleanupError`, forces
+   `passed=False` (unhandled residue never claims complete success), and
+   when a primary failure is already propagating the cleanup failure is
+   chained onto it so both remain visible. Subprocess waits are bounded
+   by a total deadline (`AIC_BACKUP_SUBPROCESS_DEADLINE`, default 900 s)
+   with process-group termination on expiry, and stderr capture is
+   size-bounded.
 
 ### 4.1 Application-level battery (the four required demonstrations)
 
@@ -319,7 +351,8 @@ designed:
 
 ## 9. Test coverage & CI
 
-`tests/operational/test_backup_pipeline.py` — 54 tests:
+`tests/operational/test_backup_pipeline.py` — 54 tests, plus
+`tests/operational/test_p0_hardening.py` — 52 tests (ADR-0011):
 
 * **Unit (no tools needed):** manifest semantics (no row counts!),
   destination guard, storage protocol (marker-last, conflict, idempotent
@@ -341,6 +374,20 @@ designed:
   (fail-closed); least-privilege role success; Railway/public-host/
   production-name destination refusals; explicit allowlist override;
   no plaintext files anywhere; no credentials in CLI output.
+* **P0 hardening (ADR-0011, `test_p0_hardening.py`):** the R10 adversarial
+  matrix (query host/hostaddr/port/service/user/dbname/options/passfile
+  overrides, duplicate and unknown parameters, Unix-socket refusal,
+  malformed URLs, inherited `PG*` stripping, guard==canonical==libpq
+  three-way destination equality); the R11 publication-truthfulness
+  battery (marker with missing/truncated/edited artifacts or manifests,
+  unreadable or hand-edited markers, interrupted commit-marker retries,
+  transient-failure retries, concurrent same-id publications — same and
+  differing content — latest-pointer failure semantics, valid-set
+  preservation on conflict); and the R12 cleanup/fault-injection set
+  (publication-failure staging removal with observed outcome,
+  cleanup-failure reporting on both success and failure paths,
+  deadline-bounded termination of SIGTERM-refusing subprocesses, bounded
+  stderr, drop-failure propagation and the drill cleanup verdicts).
 
 `tests/operational/test_recovery_keys.py` — 38 tests (ADR-0010,
 Stage 2): the recovery-key **continuity scenarios 1–11** (single-copy
@@ -441,3 +488,61 @@ is where the RTO claim would first become a measurement.
 
 Nothing in Stage 1 provisions any of these resources, holds any real
 credential, or alters Railway in any way.
+
+## 13. P0 security hardening summary (ADR-0011 — R10/R11/R12)
+
+Independent remediation of the three P0 findings confirmed by the
+2026-10-19 comprehensive risk review (probes T09/T10/T11/T12). Details and
+rationale: `docs/ADR/0011-p0-backup-recovery-hardening.md`.
+
+### 13.1 What changed for operators
+
+| Invariant | Before (defect) | Now |
+|---|---|---|
+| **Validated destination == effective destination** (R10) | `?host=` query overrides and inherited `PG*` env vars could redirect `pg_dump`/`pg_restore` away from the host the guard approved | One `CanonicalConnection` parse feeds the guard, SQLAlchemy and every subprocess; destination-redirecting/duplicate/unknown query params are hard errors; Unix-socket (hostless) URLs are refused; inherited `PG*` variables never reach a child process; in-process connections pin explicit parameters and refuse unpinnable inherited redirectors (`PGHOSTADDR`/`PGSERVICE`…) fail-closed — no process-global env mutation, thread-safe (§8) |
+| **`verified-published` implies a verifiable object set** (R11) | The idempotent fast path trusted the commit marker alone — a deleted artifact still reported success on replay | Every replay re-verifies artifact + manifest hashes against the marker; anything missing/corrupted raises `PublishedSetCorrupted` (the id stays immutable — recover via a new id or a trusted copy); publication uses unique staging names, exclusive-create promotion and fsync; filesystems without hard links fail safely BEFORE staging instead of overwriting (§9) |
+| **Failures clean up observably** (R12) | Publication failures left the staged `.part` ciphertext; `_drop_database` swallowed errors, so a failed cleanup looked like success; subprocess waits were unbounded | Staged-artifact removal is observed on every path (failure path: appended to the error; success path: explicit warning); drill cleanup raises `DrillCleanupError`, re-queries `pg_database` to confirm the drop, and the report's `cleanup_state`/`cleanup_detail` demote a residue-leaving drill to FAIL; every subprocess wait is deadline-bounded with process-group termination; stderr capture is size-bounded |
+
+`latest.json` is now documented as what it always was — a rebuildable
+convenience index: a failed update is a printed warning and never fails a
+committed, verified backup. `AIC_BACKUP_SUBPROCESS_DEADLINE` (seconds,
+default 900) bounds every tool invocation.
+
+### 13.2 Residual risks and platform limitations (honest)
+
+* **Network isolation is still an independent control.** Loopback/private
+  heuristics plus disposable-name allowlisting are application-layer
+  guards; they do not replace network segmentation or least-privilege DB
+  roles. A hostile *local* user who can control the parent process
+  environment or impersonate the operator remains outside this threat
+  model.
+* **`SIGKILL` of the whole drill process bypasses `finally`.** An
+  orphaned `aic_drill_*` database can remain if the host dies mid-drill;
+  the recommended lease/TTL janitor for such residue is future
+  infrastructure work (Stage 3+, separately reviewed). Today: check
+  `pg_database` for `aic_drill_*` names after any host-level crash.
+* **Platform guarantees:** directory fsync is best-effort (unsupported
+  on some platforms — proceed without it there). Hard-link promotion is
+  REQUIRED for new publications: storage filesystems without hard-link
+  support (exFAT/FAT32, some network mounts) fail safely with
+  `PublicationUnsupportedError` before anything is staged — they never
+  silently overwrite a committed backup (residual review §9); read-only
+  idempotent replays still work anywhere. `latest.json` is the one
+  deliberate `os.replace` user (rebuildable index, not a committed
+  object). Process-group kills are POSIX-only (Windows terminates only
+  the direct child). CI runs Linux; document any non-POSIX production
+  use before relying on it.
+* **In-process environment inheritance (residual review §8):** purely
+  behavioural `PG*` variables (application name, connect timeout,
+  options, client encoding, date style, timezone, keepalives) may still
+  be inherited by in-process connections; they cannot change the
+  destination, credentials, identity or transport security mode.
+  Destination/credential/identity/trust-relevant variables the URL
+  cannot override are refused fail-closed instead of silently honoured
+  or ignored.
+* **R13 remains open (unchanged):** hashes and age encryption prove
+  integrity/confidentiality, not provenance. A forged-but-internally
+  consistent storage state is only caught at drill time by possession of
+  the real age identity. Out of scope for ADR-0011.
+* Synthetic tests prove the machinery, **not** production disaster-recovery
+  readiness (unchanged Stage 1 honesty: real-data drills are Stage 4).
