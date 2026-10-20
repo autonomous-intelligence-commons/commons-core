@@ -80,7 +80,7 @@ def verify_age_file(path) -> None:
         first = lines[0][:40] if lines else b"<empty>"
         raise AgeFormatError(f"missing age v1 magic line (got {first!r})")
 
-    saw_x25519_stanza = False
+    x25519_stanzas = 0
     saw_separator = False
     separator_end = None
     i = 1
@@ -101,9 +101,10 @@ def verify_age_file(path) -> None:
         if stanza_type == b"X25519":
             if len(parts) != 2 or not _is_base64_line(parts[1]):
                 raise AgeFormatError("X25519 stanza has a malformed ephemeral share")
-            if saw_x25519_stanza:
-                raise AgeFormatError("multiple X25519 stanzas not expected for a single recipient")
-            saw_x25519_stanza = True
+            # Multiple X25519 stanzas are legitimate: Stage 2 recipient
+            # rotation (spec §8) encrypts one stanza per recipient. The age
+            # v1 spec places no single-stanza limit on X25519 recipients.
+            x25519_stanzas += 1
         body_offset = i + 1
         while (
             body_offset < len(lines)
@@ -115,7 +116,7 @@ def verify_age_file(path) -> None:
             body_offset += 1
         i = body_offset
 
-    if not saw_x25519_stanza:
+    if x25519_stanzas < 1:
         raise AgeFormatError("no X25519 recipient stanza found in the header")
     if not saw_separator or separator_end is None:
         raise AgeFormatError("missing '--- <mac>' header/payload separator")
