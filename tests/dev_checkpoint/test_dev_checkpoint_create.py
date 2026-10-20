@@ -375,3 +375,47 @@ class TestCreateNegative:
             "hashy",
         )
         assert proc.returncode == 0, proc.stderr
+
+    def test_secret_scan_tolerates_slash_joined_identifier_lists(self, synth) -> None:
+        # REAL false positives observed while dogfooding the tool on the
+        # actual task worklog: slash-joined identifier lists are long
+        # [A-Za-z0-9+/] runs but never mix digits with both cases.
+        commit_file(
+            synth.repo,
+            "identifiers.txt",
+            "exports: DrillCleanupError/PublishedSetCorrupted/"
+            "DeadlineExceeded/CanonicalConnection/BackupError\n"
+            "params: host/hostaddr/port/service/user/dbname/options/passfile\n"
+            "dirs: unit/integration/operational/privacy/recovery/security\n",
+            "docs: identifier lists are not key material",
+        )
+        proc = run_tool(
+            CREATE_TOOL,
+            "--repo",
+            str(synth.repo),
+            "--output-dir",
+            str(synth.out),
+            "--task-slug",
+            "identy",
+        )
+        assert proc.returncode == 0, proc.stderr
+
+    def test_secret_scan_catches_key_shaped_base64(self, synth) -> None:
+        # Mixed-case + digits base64 in a >40-char literal IS key-shaped.
+        commit_file(
+            synth.repo,
+            "keymat.txt",
+            "the key is c3VwZXJzZWNyZXQxMjM0NTY3ODkwQUJDREVGR0hJSktMTU5PUFF\n",
+            "chore: synthetic key material",
+        )
+        proc = run_tool(
+            CREATE_TOOL,
+            "--repo",
+            str(synth.repo),
+            "--output-dir",
+            str(synth.out),
+            "--task-slug",
+            "keymat",
+        )
+        assert proc.returncode == 3
+        assert "high-entropy-literal" in proc.stderr

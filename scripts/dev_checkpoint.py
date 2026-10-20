@@ -88,8 +88,26 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 # and documentation.
 _HEX_WHITELIST = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 # Long base64-ish literals (mixed case + digits) — the shape of age
-# identities and API keys, distinct from whitelisted hex constants.
+# identities and API keys, distinct from whitelisted hex constants and from
+# slash-joined identifier/path lists (which never mix digits with both
+# cases).  Heuristic, not a guarantee — documented in §9 of the protocol.
 _ENTROPY_CANDIDATE = re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b")
+
+
+def _looks_like_key_material(token: str) -> bool:
+    """Key-shaped: at least one digit, one lowercase and one uppercase.
+
+    Excludes the false positives observed in real worklogs (identifier
+    lists like ``DrillCleanupError/PublishedSetCorrupted/...`` or
+    ``host/hostaddr/port/service/...`` — long [A-Za-z0-9+/] runs that mix
+    cases OR digits but never both) while still catching base64-style key
+    material.
+    """
+    return (
+        any(c.isdigit() for c in token)
+        and any(c.islower() for c in token)
+        and any(c.isupper() for c in token)
+    )
 
 
 def scan_text_for_secrets(text: str) -> list[dict[str, str]]:
@@ -118,6 +136,8 @@ def scan_text_for_secrets(text: str) -> list[dict[str, str]]:
         if _HEX_WHITELIST.match(token):
             continue
         if token.isdigit() or token.isalpha():
+            continue
+        if not _looks_like_key_material(token):
             continue
         record("high-entropy-literal", text.count("\n", 0, match.start()) + 1, token)
     findings.sort(key=lambda f: (int(f["line"]), f["pattern"]))
