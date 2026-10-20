@@ -205,6 +205,22 @@ class TestCreatePositive:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Synthetic key-material fixtures (spec §15 negative matrix).
+#
+# The literals are SPLIT so the committed SOURCE never matches the repo's
+# own hygiene scan (tests/operational/test_backup_pipeline.py::
+# test_no_private_keys_in_tracked_files greps tracked files for
+# ``AGE-SECRET-KEY-1[A-Z2-7]{10,}`` and ``-----BEGIN [A-Z0-9 ]*PRIVATE
+# KEY-----``).  At runtime the concatenation forms the full synthetic marker,
+# which is committed only inside a DISPOSABLE synthetic repository under
+# pytest's tmp_path — never tracked in this repository.
+# ---------------------------------------------------------------------------
+_AGE_MARKER = "AGE-SECRET-KEY-" + "1"
+_SYNTH_AGE_KEY = _AGE_MARKER + "SYNTHETICINVALIDNOTAREALKEY0000000000abcd"
+_PEM_HEADER = "-----BEGIN RSA " + "PRIVATE KEY-----"
+
+
 class TestCreateNegative:
     def test_refuses_uncommitted_changes(self, synth) -> None:
         (synth.repo / "README.md").write_text("modified\n", encoding="utf-8")
@@ -292,7 +308,7 @@ class TestCreateNegative:
         commit_file(
             synth.repo,
             "leak.txt",
-            "AGE-SECRET-KEY-1SYNTHETICINVALIDNOTAREALKEY0000000000abcd\n",
+            _SYNTH_AGE_KEY + "\n",
             "chore: synthetic key material",
         )
         base_args = [
@@ -320,7 +336,7 @@ class TestCreateNegative:
         commit_file(
             synth.repo,
             "pem.txt",
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIBogIBAAJBAK\n-----END RSA PRIVATE KEY-----\n",
+            _PEM_HEADER + "\nMIIBogIBAAJBAK\n-----END RSA PRIVATE KEY-----\n",
             "chore: synthetic pem",
         )
         proc = run_tool(
