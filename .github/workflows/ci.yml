@@ -18,6 +18,11 @@
 #              user, fail-closed production startup, postgres+migrate+api+
 #              worker startup order, authenticated API smoke, deterministic
 #              worker task execution, port-exposure audit, clean teardown.
+#   checkpoint-tools — Development Checkpoint & Resume Protocol
+#              (docs/DEVELOPMENT_CHECKPOINTS.md): synthetic, NETWORK-FREE
+#              test matrix for the checkpoint create/verify/resume tooling.
+#              The genuine external-delivery drill stays a recorded MANUAL
+#              integration test — CI never touches file-hosting services.
 #
 # Spec §30 requirements covered:
 #   lint            — formatting + linting (ruff, pinned to project version)
@@ -98,6 +103,42 @@ jobs:
         with:
           name: pytest-results
           path: pytest-results.xml
+          if-no-files-found: error
+
+  checkpoint-tools:
+    # Development Checkpoint & Resume Protocol (docs/DEVELOPMENT_CHECKPOINTS.md):
+    # the synthetic test matrix for scripts/dev_checkpoint.py,
+    # dev_checkpoint_verify.py and dev_resume_check.py. Deliberately:
+    #   - NETWORK-FREE: no external delivery in CI — the genuine external
+    #     recovery drill is a recorded manual integration test (protocol §8);
+    #     CI never touches file-hosting services (protocol §14).
+    #   - SERVICE-FREE: disposable synthetic Git repositories under pytest's
+    #     tmp_path only; no PostgreSQL, no age, no application database.
+    #   - ADDITIVE: all pre-existing jobs and checks are preserved unchanged.
+    name: Development checkpoint tools (synthetic, network-free)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
+        with:
+          python-version: "3.12"
+      # ".[dev]": the root tests/conftest.py imports the application at module
+      # scope, so its fixtures must stay importable even though these tests
+      # never use them. No postgres extra needed — no test here connects out.
+      - name: Install application + dev dependencies (pinned)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Run the synthetic checkpoint-tool suite (no network)
+        run: python -m pytest tests/dev_checkpoint -q --junitxml=checkpoint-results.xml
+      - name: Upload checkpoint tool test results
+        if: always() # upload even when tests fail, for triage
+        uses: actions/upload-artifact@v4 # TODO: pin to commit SHA after first verified run
+        with:
+          name: checkpoint-results
+          path: checkpoint-results.xml
           if-no-files-found: error
 
   postgres:
