@@ -82,6 +82,7 @@ from .storage import (
     BackupConflictError,
     LocalFilesystemStorage,
     MissingBackupObject,
+    PublicationUnsupportedError,
     PublishedSetCorrupted,
     StorageError,
 )
@@ -101,6 +102,7 @@ __all__ = [
     "MissingBackupObject",
     "PreflightError",
     "PublicationFailed",
+    "PublicationUnsupportedError",
     "PublishedSetCorrupted",
     "StorageError",
     "Toolbelt",

@@ -47,13 +47,19 @@ mode ``0700`` and files with ``0600``. It grants itself no delete on final
 objects — deletion is a retention-administrator concern implemented in a
 FUTURE, separately reviewed stage.
 
-Platform limitations (documented honestly, R11/R12): directory fsync is
-unsupported on some platforms/filesystems (e.g. Windows) — there the code
-proceeds without it and the operator must not assume crash-atomicity of
-the marker ordering on those platforms; the exclusive-create promotion
-falls back to ``os.replace`` where ``os.link`` is unusable, which preserves
-single-writer semantics but not last-writer prevention between concurrent
-processes on those platforms.
+Platform limitations (documented honestly, R11/R12 + residual review §9):
+directory fsync is unsupported on some platforms/filesystems (e.g.
+Windows) — there the code proceeds without it and the operator must not
+assume crash-atomicity of the marker ordering on those platforms. The
+exclusive-create promotion REQUIRES hard-link support (ext4/xfs/btrfs/
+zfs/APFS/NTFS…): where ``os.link`` is unusable (exFAT/FAT32, some network
+mounts) publication FAILS SAFELY with :class:`PublicationUnsupportedError`
+BEFORE anything is staged — it never silently downgrades to
+``os.replace``, which is atomic but last-writer-wins and could overwrite
+an already-committed backup (the §9 invariant: an existing committed
+backup must never be silently overwritten by another publication
+attempt). "latest.json" is the one deliberate ``os.replace`` user — it
+is a rebuildable index, not a committed object.
 """
 
 from __future__ import annotations
@@ -99,6 +105,21 @@ class PublishedSetCorrupted(StorageError):
     immutable — recovery means publishing under a NEW id (or restoring the
     objects from a trusted copy and re-verifying), never re-blessing this
     one through the fast path.
+    """
+
+
+class PublicationUnsupportedError(StorageError):
+    """The storage filesystem cannot support no-overwrite publication (§9).
+
+    Raised when hard links — the exclusive-create primitive behind the
+    R11 publication protocol — are unavailable in a target directory
+    (EPERM/EXDEV/ENOSYS/EOPNOTSUPP…; e.g. exFAT/FAT32 or some network
+    mounts). Publication then FAILS SAFELY: nothing is staged over an
+    existing object, nothing is overwritten, and no destructive fallback
+    is taken. ``os.replace`` would be atomic but last-writer-wins — it
+    could silently replace an already-committed backup, which the §9
+    invariant forbids. Never transient: retrying on the same filesystem
+    cannot help.
     """
 
 
@@ -182,19 +203,63 @@ def _promote_exclusive(tmp: Path, final: Path) -> None:
 
     ``os.link`` is an exclusive create on POSIX: it fails with EEXIST if
     the final name already exists, so two concurrent publishers cannot
-    both win. Where hard links are unavailable the fallback is
-    ``os.replace`` — atomic, but last-writer-wins between concurrent
-    processes on those platforms (documented limitation).
+    both win. Where hard links are unavailable (EPERM/EXDEV/ENOSYS or a
+    filesystem without link support — exFAT/FAT32, some network mounts)
+    this FAILS SAFELY with :class:`PublicationUnsupportedError` instead of
+    downgrading to a destructive ``os.replace``: the §9 invariant is that
+    an existing committed backup must never be silently overwritten, and
+    an atomic-but-last-writer-wins replace cannot guarantee that.
     """
     try:
         os.link(tmp, final)
         return
     except FileExistsError:
         raise  # genuine conflict — caller compares hashes and decides
-    except OSError:
-        # EPERM/EXDEV/ENOSYS or platform without hard links — documented
-        # fallback: atomic replace without the exclusive-create guarantee.
-        os.replace(tmp, final)
+    except OSError as exc:
+        raise PublicationUnsupportedError(
+            f"cannot publish {final.name!r}: this filesystem/directory does not "
+            f"support hard links ({type(exc).__name__}: {exc}) — the no-overwrite "
+            "publication guarantee requires them; refusing to fall back to a "
+            "destructive replace (R11 / residual review §9). Use a filesystem "
+            "with hard-link support (ext4/xfs/btrfs/zfs/APFS/NTFS…) for the "
+            "backup storage root"
+        ) from exc
+
+
+def _verify_publication_support(directory: Path) -> None:
+    """Fail fast when ``directory`` cannot support no-overwrite promotion.
+
+    Probes hard-link support exactly the way publication uses it (a fresh
+    staging file in the SAME directory linked onto a fresh final name,
+    both removed afterwards) so an unsupported filesystem — exFAT/FAT32,
+    some network mounts — aborts publication BEFORE anything is staged,
+    with a clear operator-facing error, instead of failing (or worse,
+    silently overwriting) mid-publication.
+    """
+    probe_a = directory / f".publish-probe-{uuid.uuid4().hex}.a"
+    probe_b = directory / f".publish-probe-{uuid.uuid4().hex}.b"
+    try:
+        fd = os.open(probe_a, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(b"publish-support-probe")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.link(probe_a, probe_b)
+    except OSError as exc:
+        raise PublicationUnsupportedError(
+            f"storage directory {directory} cannot support no-overwrite "
+            f"publication ({type(exc).__name__}: {exc}) — hard links are "
+            "required so an existing committed backup can never be silently "
+            "overwritten; refusing to stage anything (R11 / residual review "
+            "§9). Use a filesystem with hard-link support "
+            "(ext4/xfs/btrfs/zfs/APFS/NTFS…) for the backup storage root"
+        ) from exc
+    finally:
+        for probe in (probe_a, probe_b):
+            try:
+                os.unlink(probe)
+            except OSError:
+                pass  # best effort: probes are 0600 dot-files, harmless if stranded
 
 
 def _write_part(path: Path, payload: bytes, *, expected_sha256: str) -> None:
@@ -271,8 +336,8 @@ class LocalFilesystemStorage:
         for attempt in range(1, self.retry_attempts + 1):
             try:
                 return operation()
-            except BackupConflictError:
-                raise
+            except (BackupConflictError, PublicationUnsupportedError):
+                raise  # immutable-id conflict / unsupported filesystem: retrying cannot help
             except StorageError as exc:
                 if not exc.transient and "refusing to overwrite" in str(exc):
                     raise
@@ -414,6 +479,17 @@ class LocalFilesystemStorage:
                 f"({marker.get('artifact_sha256', '?')[:12]}… != {artifact_sha256[:12]}…) — "
                 "backup ids are immutable; refusing to overwrite"
             )
+
+        # §9 residual review: this is a NEW publication (the idempotent
+        # fast path above is read-only) — fail FAST, before anything is
+        # staged, when the target directories cannot support the
+        # no-overwrite promotion primitive.
+        for directory in (
+            final_artifact.parent,
+            manifest_path.parent,
+            self._marker_path(backup_id).parent,
+        ):
+            _verify_publication_support(directory)
 
         # 1-2-3: artifact — stage under a UNIQUE .part name, verify, promote
         # exclusively (never overwrite a different existing object).

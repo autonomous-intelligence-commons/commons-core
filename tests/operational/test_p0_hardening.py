@@ -1359,3 +1359,182 @@ class TestR10InProcessLivePostgres:
         assert not failures
         # The shared environment was read-only for the whole drill.
         assert os.environ["PGHOST"] == "no-such-host.example.invalid"
+
+
+# ---------------------------------------------------------------------------
+# §9 residual review — atomic publication fails safely without hard links
+# ---------------------------------------------------------------------------
+class TestR11AtomicPublicationFailSafe:
+    """The §9 invariant: an existing committed backup must NEVER be silently
+    overwritten by another publication attempt.
+
+    The former ``os.replace`` fallback (taken when ``os.link`` raised
+    EPERM/EXDEV/ENOSYS — exFAT/FAT32, some network mounts) was atomic but
+    last-writer-wins: on such filesystems a second publication would
+    silently REPLACE a committed object. The fallback is now a hard
+    :class:`PublicationUnsupportedError` plus a pre-publication capability
+    probe so nothing is even staged.
+    """
+
+    def test_probe_catches_unsupported_filesystem_before_staging(self, tmp_path, monkeypatch):
+        """A filesystem without hard-link support aborts publication at the
+        pre-flight probe: nothing staged, nothing overwritten, no probe
+        dot-files left behind."""
+        from commons_core.backup.storage import PublicationUnsupportedError
+
+        root = tmp_path / "storage"
+        real_link = os.link
+
+        def broken_link(src, dst, **kwargs):
+            raise OSError(1, "Operation not permitted")  # EPERM-shaped
+
+        monkeypatch.setattr(os, "link", broken_link)
+        with pytest.raises(PublicationUnsupportedError, match="hard links"):
+            _publish_into(root, "probe-backup", b"payload")
+        for sub in ("data", "manifest", "status"):
+            directory = root / sub
+            if directory.exists():
+                leftovers = [
+                    p.name
+                    for p in directory.iterdir()
+                    if p.name.endswith(".part") or p.name.startswith(".publish-probe-")
+                ]
+                assert leftovers == [], f"stray files in {sub}: {leftovers}"
+        # The capability is re-probed per publish; restoring links unblocks.
+        monkeypatch.setattr(os, "link", real_link)
+        _, _, marker = _publish_into(root, "probe-backup", b"payload")
+        assert marker["state"] == "verified-published"
+
+    def test_committed_backup_survives_unsupported_filesystem(self, tmp_path, monkeypatch):
+        """The core §9 regression: with a set already committed, a later
+        publication attempt on a (now) link-less filesystem must fail — the
+        committed artifact, manifest and marker stay byte-identical."""
+        from commons_core.backup.storage import PublicationUnsupportedError
+
+        root = tmp_path / "storage"
+        storage, manifest, marker = _publish_into(root, "committed-set", b"original-ciphertext")
+        before = {
+            "artifact": (root / "data" / "committed-set.age").read_bytes(),
+            "manifest": (root / "manifest" / "committed-set.json").read_bytes(),
+            "marker": (root / "status" / "committed-set.json").read_bytes(),
+        }
+        monkeypatch.setattr(
+            os,
+            "link",
+            lambda *a, **k: (_ for _ in ()).throw(OSError(38, "Function not implemented")),
+        )
+        # New backup ids on the same storage root: refused, nothing staged.
+        with pytest.raises(PublicationUnsupportedError):
+            _publish_into(root, "second-set", b"other-ciphertext")
+        with pytest.raises(PublicationUnsupportedError):
+            _publish_into(root, "third-set", b"third-ciphertext")
+        assert (root / "data" / "committed-set.age").read_bytes() == before["artifact"]
+        assert (root / "manifest" / "committed-set.json").read_bytes() == before["manifest"]
+        assert (root / "status" / "committed-set.json").read_bytes() == before["marker"]
+
+    def test_read_only_idempotent_replay_still_works_without_links(self, tmp_path, monkeypatch):
+        """The idempotent fast path is read-only (re-verify + latest
+        refresh): a replay of an ALREADY-committed set succeeds even on a
+        filesystem whose hard links broke afterwards — refusal applies to
+        NEW publications only."""
+        from commons_core.backup.storage import PublicationUnsupportedError
+
+        root = tmp_path / "storage"
+        storage, manifest, marker = _publish_into(root, "committed-set", b"same-ciphertext")
+        monkeypatch.setattr(
+            os, "link", lambda *a, **k: (_ for _ in ()).throw(OSError(1, "Operation not permitted"))
+        )
+        _, _, replayed = _publish_into(root, "committed-set", b"same-ciphertext")
+        assert replayed["state"] == "verified-published"  # read-only path
+        with pytest.raises(PublicationUnsupportedError):
+            _publish_into(root, "a-new-set", b"more-ciphertext")  # writes refuse
+
+    def test_promotion_failure_mid_publish_cleans_staging_and_keeps_set(
+        self, tmp_path, monkeypatch
+    ):
+        """Probe passes (links work), but the artifact promotion itself hits
+        EPERM: fail-safe error, staged ``.part`` removed, committed set and
+        markers untouched."""
+        from commons_core.backup.storage import PublicationUnsupportedError
+
+        root = tmp_path / "storage"
+        storage, manifest, marker = _publish_into(root, "first", b"first-ciphertext")
+        real_link = os.link
+
+        def selective_link(src, dst, **kwargs):
+            if str(dst).endswith("second.age"):
+                raise OSError(1, "Operation not permitted")
+            return real_link(src, dst, **kwargs)
+
+        monkeypatch.setattr(os, "link", selective_link)
+        with pytest.raises(PublicationUnsupportedError, match="second.age"):
+            _publish_into(root, "second", b"second-ciphertext")
+        assert list((root / "data").glob("*.part")) == []  # staging cleaned
+        assert (root / "data" / "first.age").read_bytes() == b"first-ciphertext"
+        assert not (root / "status" / "second.json").exists()  # never committed
+
+    def test_capability_error_is_not_retried(self, tmp_path, monkeypatch):
+        """PublicationUnsupportedError is terminal — _with_retries must not
+        sleep-and-retry a filesystem that cannot grow hard links."""
+        from commons_core.backup.storage import PublicationUnsupportedError
+
+        root = tmp_path / "storage"
+        storage = LocalFilesystemStorage(root)
+        calls = {"n": 0}
+        real_link = os.link
+
+        def selective_counting_link(src, dst, **kwargs):
+            calls["n"] += 1
+            if str(dst).endswith("no-retry.age"):
+                raise OSError(1, "Operation not permitted")
+            return real_link(src, dst, **kwargs)
+
+        monkeypatch.setattr(os, "link", selective_counting_link)
+        with pytest.raises(PublicationUnsupportedError):
+            _publish_into(root, "no-retry", b"payload", storage=storage)
+        # 3 successful directory probes + exactly ONE promote attempt: the
+        # capability error was not retried (a retry loop would count 4+).
+        assert calls["n"] == 4
+
+    def test_run_backup_surfaces_unsupported_publication_as_failure(self, tmp_path, monkeypatch):
+        """End-to-end through run_backup: an unsupported storage filesystem
+        is a PublicationFailed backup failure (never a silent success), and
+        the staged .part artifact is cleaned up (R12)."""
+
+        def synth_stream(**kwargs):
+            kwargs["staged_artifact"].write_bytes(b"synthetic encrypted placeholder")
+
+        belt = SimpleNamespace(
+            ensure_compatible=lambda x: None,
+            version_info=lambda: {"age": "synthetic", "pg_dump": "synthetic"},
+        )
+        storage = LocalFilesystemStorage(tmp_path / "storage")
+        monkeypatch.setattr(
+            os,
+            "link",
+            lambda *a, **k: (_ for _ in ()).throw(OSError(95, "Operation not supported")),
+        )
+        with (
+            patch.object(
+                pipeline,
+                "_source_metadata",
+                return_value=(
+                    {"server_version": "PostgreSQL 18.6", "database_name": "synthetic"},
+                    "0001",
+                    18,
+                ),
+            ),
+            patch.object(pipeline, "_stream_dump_to_age", side_effect=synth_stream),
+            patch.object(pipeline, "verify_age_file", return_value=None),
+        ):
+            with pytest.raises(PublicationFailed, match="hard link|not supported"):
+                run_backup(
+                    database_url="postgresql://commons:pw@127.0.0.1:5432/synthetic",
+                    recipient="age1example",
+                    storage=storage,
+                    work_dir=tmp_path / "work",
+                    toolbelt=belt,
+                    backup_id="unsupported-fs",
+                )
+        assert list((tmp_path / "work").rglob("*.part")) == []  # staging cleaned (R12)
+        assert storage.list_backup_ids() == []  # nothing committed
