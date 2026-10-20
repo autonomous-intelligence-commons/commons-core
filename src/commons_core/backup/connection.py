@@ -45,16 +45,15 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Mapping
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, quote, unquote, urlsplit, urlunsplit
 
 __all__ = [
     "ConnectionContractError",
+    "InProcessEnvironmentError",
     "CanonicalConnection",
     "canonical_from_url",
-    "scrubbed_pg_environ",
 ]
 
 
@@ -63,6 +62,21 @@ class ConnectionContractError(RuntimeError):
 
     The message is credential-free by construction: it names parameters
     and hosts, never passwords.
+    """
+
+
+class InProcessEnvironmentError(ConnectionContractError):
+    """The inherited environment would influence an in-process connection.
+
+    Raised by :meth:`CanonicalConnection.audit_in_process_environment` when
+    a ``PG*`` variable is set that the canonical URL cannot override (the
+    parameter is rejected from URLs outright, or the URL simply does not
+    pin the slot). Fail-closed: the operation refuses to run rather than
+    silently honouring — or silently ignoring — ambient libpq
+    configuration. No process-global state is mutated (spec §8 residual
+    review: the former ``scrubbed_pg_environ`` context manager temporarily
+    mutated ``os.environ``; explicit parameters plus this audit replace it
+    with thread-safe per-connection construction).
     """
 
 
@@ -289,33 +303,117 @@ class CanonicalConnection:
         query = "&".join(f"{k}={quote(v, safe='')}" for k, v in sorted(self.params.items()))
         return urlunsplit(("postgresql+psycopg", netloc, path, query, ""))
 
+    # -- in-process connections (residual review §8) ------------------------
+    def audit_in_process_environment(self) -> None:
+        """Fail closed if inherited ``PG*`` variables would fill any slot
+        the canonical URL does not pin.
+
+        ``libpq`` resolves every connection parameter with conninfo >
+        environment > service file > defaults. The URL pins host, port,
+        database, user (when present), password (when present) and the
+        allowlisted query parameters, so those slots can never be steered
+        by the environment. The variables audited here are the ones that
+        would STILL take effect for slots the URL leaves unset — and that
+        matter for destination, credentials, identity or trust anchors:
+
+        * ``PGHOSTADDR`` / ``PGSERVICE`` / ``PGSERVICEFILE`` /
+          ``PGTARGETSESSIONATTRS`` / ``PGREQUIRESSL`` /
+          ``PGSSLMINPROTOCOLVERSION`` / ``PGSSLMAXPROTOCOLVERSION`` /
+          ``PGCHANNELBINDING``: parameters the canonical contract rejects
+          from URLs outright. A service file or ``PGHOSTADDR`` can redirect
+          the effective TCP destination even when the URL names a host, so
+          presence is a hard error rather than something to silently
+          ignore (ignoring would require mutating ``os.environ`` — see the
+          residual review).
+        * ``PGPASSWORD`` / ``PGPASSFILE``: only consulted when the URL
+          carries no password — refused in exactly that case.
+        * ``PGUSER``: only consulted when the URL carries no user.
+        * ``PGSSLCERT`` / ``PGSSLKEY`` / ``PGSSLPASSWORD`` /
+          ``PGSSLROOTCERT`` / ``PGSSLCRL`` / ``PGSSLCRLDIR``: TLS material
+          and trust anchors — refused when the URL does not pin the
+          matching parameter itself.
+
+        Behavioural, non-security parameters (``PGAPPNAME``,
+        ``PGCONNECT_TIMEOUT``, ``PGOPTIONS``, ``PGCLIENTENCODING``,
+        ``PGDATESTYLE``, ``PGTZ``, keepalives…) may still be inherited;
+        they cannot change the destination, the credentials or the
+        transport security mode, and are documented as such.
+
+        This check NEVER mutates ``os.environ`` — it is therefore safe
+        under concurrent invocation from multiple threads (the former
+        process-global scrub was not).
+        """
+        forbidden: set[str] = set(_UNPINNABLE_PG_ENV)
+        if self.password is None:
+            forbidden |= {"PGPASSWORD", "PGPASSFILE"}
+        if self.user is None:
+            forbidden.add("PGUSER")
+        for env_name, slot in _TLS_TRUST_ENV.items():
+            if slot not in self.params:
+                forbidden.add(env_name)
+        offending = sorted(key for key in os.environ if key in forbidden)
+        if offending:
+            raise InProcessEnvironmentError(
+                "inherited environment variables can influence connection "
+                "parameters the database URL does not pin: "
+                + ", ".join(offending)
+                + " — unset them (or put the values in the database URL) and "
+                "retry; in-process connections refuse to run on ambient "
+                "libpq configuration (R10 / residual review §8)"
+            )
+
+    def psycopg_connect_kwargs(self) -> dict[str, str]:
+        """Explicit connect arguments for in-process SQLAlchemy/psycopg use.
+
+        Everything the canonical URL pins already reaches libpq through
+        the SQLAlchemy URL (authority + allowlisted query). The one
+        security-relevant slot the URL may leave unset is pinned here to
+        libpq's documented default, so an inherited ``PGSSLMODE`` can never
+        downgrade the transport for an in-process connection:
+
+        * ``sslmode`` — pinned to ``prefer`` when the URL does not set it.
+
+        Returns an empty mapping when the URL already pins everything
+        (values are never duplicated between the URL query and
+        ``connect_args``).
+        """
+        kwargs: dict[str, str] = {}
+        if "sslmode" not in self.params:
+            kwargs["sslmode"] = "prefer"
+        return kwargs
+
 
 def canonical_from_url(url: str) -> CanonicalConnection:
     """Parse a URL into the single canonical connection (fail-closed)."""
     return CanonicalConnection.from_url(url)
 
 
-@contextmanager
-def scrubbed_pg_environ() -> Iterator[None]:
-    """Temporarily remove every inherited ``PG*`` variable from the process.
+#: libpq environment variables whose corresponding connection parameter can
+#: NEVER be pinned by the canonical URL (the contract rejects it outright),
+#: and whose inherited value could redirect the effective connection or its
+#: security posture. Presence at an in-process connection is fail-closed.
+_UNPINNABLE_PG_ENV: frozenset[str] = frozenset(
+    {
+        "PGHOSTADDR",  # redirects TCP while `host` only names/verifies
+        "PGSERVICE",  # a service file can fill any unset slot (incl. hostaddr)
+        "PGSERVICEFILE",
+        "PGTARGETSESSIONATTRS",  # multi-host connection selection
+        "PGREQUIRESSL",  # deprecated transport toggle
+        "PGSSLMINPROTOCOLVERSION",
+        "PGSSLMAXPROTOCOLVERSION",
+        "PGCHANNELBINDING",
+    }
+)
 
-    SQLAlchemy/psycopg connections read libpq environment variables
-    (``PGSERVICE`` and friends can inject ``hostaddr`` even when the DSN
-    names a host, redirecting the effective connection). Drills wrap every
-    engine interaction in this scrub so inherited variables cannot override
-    the validated destination on the Python side either.
-
-    Limitation (documented, honest): this is process-global mutation; the
-    drill is single-threaded by design. Hostile *local* users able to
-    control the parent environment remain an out-of-scope trust boundary —
-    the fix removes silent *inheritance*, not local compromise.
-    """
-    removed: dict[str, str] = {}
-    try:
-        for key in list(os.environ):
-            if key.startswith("PG"):
-                removed[key] = os.environ.pop(key)
-        yield
-    finally:
-        for key, value in removed.items():
-            os.environ[key] = value
+#: TLS material / trust-anchor environment variables → the allowlisted URL
+#: query parameter that pins the same slot. Refused only when the URL does
+#: not pin the parameter itself (a pinned slot always wins over the
+#: environment, so the variable is then provably inert).
+_TLS_TRUST_ENV: Mapping[str, str] = {
+    "PGSSLCERT": "sslcert",
+    "PGSSLKEY": "sslkey",
+    "PGSSLPASSWORD": "sslpassword",
+    "PGSSLROOTCERT": "sslrootcert",
+    "PGSSLCRL": "sslcrl",
+    "PGSSLCRLDIR": "sslcrldir",
+}

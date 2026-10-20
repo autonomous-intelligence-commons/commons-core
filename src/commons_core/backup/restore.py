@@ -34,11 +34,11 @@ R10 — the validated destination IS the effective connection: the drill
 parses the server URL once through the canonical connection contract
 (:mod:`commons_core.backup.connection`) and derives EVERY connection from
 that single parse — ``CREATE DATABASE``, the ``pg_restore`` subprocess,
-the verification battery, and ``DROP DATABASE``. Inherited ``PG*``
-environment variables are scrubbed for the whole drill (SQLAlchemy/psycopg
-reads them too), and the subprocess receives the fully-controlled child
-environment. Query-string overrides like ``?host=…`` are rejected before
-anything connects.
+the verification battery, and ``DROP DATABASE``. In-process connections
+are built with explicit connect arguments after a fail-closed environment
+audit (no process-global mutation — residual review §8), and the
+subprocess receives the fully-controlled child environment. Query-string
+overrides like ``?host=…`` are rejected before anything connects.
 
 R12 — cleanup is explicit, bounded and verifiable: ``_drop_database`` no
 longer swallows failures (T11); it RAISES :class:`DrillCleanupError`, the
@@ -60,6 +60,7 @@ import os
 import secrets
 import sys
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -68,7 +69,6 @@ from sqlalchemy import create_engine, select, text
 from .connection import (
     CanonicalConnection,
     ConnectionContractError,
-    scrubbed_pg_environ,
 )
 from .destination import (
     UnsafeDestinationError,
@@ -171,18 +171,22 @@ def _create_database(server_url: str, name: str) -> None:
     admin = _admin_connection(server_url)
     engine = None
     try:
-        with scrubbed_pg_environ():
-            engine = create_engine(admin.sqlalchemy_url(), isolation_level="AUTOCOMMIT")
-            with engine.connect() as conn:
-                exists = conn.execute(
-                    text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": name}
-                ).scalar()
-                if exists:
-                    raise DrillFailure(
-                        f"disposable database {name!r} already exists — refusing to reuse "
-                        "(unique names per drill run are mandatory)"
-                    )
-                conn.execute(text(f'CREATE DATABASE "{name}"'))
+        admin.audit_in_process_environment()
+        engine = create_engine(
+            admin.sqlalchemy_url(),
+            connect_args=admin.psycopg_connect_kwargs(),
+            isolation_level="AUTOCOMMIT",
+        )
+        with engine.connect() as conn:
+            exists = conn.execute(
+                text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": name}
+            ).scalar()
+            if exists:
+                raise DrillFailure(
+                    f"disposable database {name!r} already exists — refusing to reuse "
+                    "(unique names per drill run are mandatory)"
+                )
+            conn.execute(text(f'CREATE DATABASE "{name}"'))
     except DrillFailure:
         raise
     except Exception as exc:  # noqa: BLE001 — surface as a drill gate failure
@@ -210,20 +214,24 @@ def _drop_database(server_url: str, name: str) -> None:
     admin = _admin_connection(server_url)
     engine = None
     try:
-        with scrubbed_pg_environ():
-            engine = create_engine(admin.sqlalchemy_url(), isolation_level="AUTOCOMMIT")
-            with engine.connect() as conn:
-                conn.execute(
-                    text(
-                        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                        "WHERE datname = :n AND pid <> pg_backend_pid()"
-                    ),
-                    {"n": name},
-                )
-                conn.execute(text(f'DROP DATABASE IF EXISTS "{name}"'))
-                still_exists = conn.execute(
-                    text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": name}
-                ).scalar()
+        admin.audit_in_process_environment()
+        engine = create_engine(
+            admin.sqlalchemy_url(),
+            connect_args=admin.psycopg_connect_kwargs(),
+            isolation_level="AUTOCOMMIT",
+        )
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = :n AND pid <> pg_backend_pid()"
+                ),
+                {"n": name},
+            )
+            conn.execute(text(f'DROP DATABASE IF EXISTS "{name}"'))
+            still_exists = conn.execute(
+                text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": name}
+            ).scalar()
         if still_exists:
             raise DrillCleanupError(
                 f"disposable database {name!r} STILL EXISTS after DROP — cleanup "
@@ -417,23 +425,25 @@ def verify_restored_database(
 ) -> DrillReport:
     """Application-level verification battery — R10 entry point.
 
-    PostgreSQL URLs are re-parsed through the canonical connection contract
-    and the whole battery runs under a PG*-scrubbed environment, so the
-    verification provably reads the SAME destination the drill validated
-    (inherited ``PGHOST``/``PGSERVICE`` cannot redirect the lazy SQLAlchemy
-    connection). Non-PostgreSQL URLs (SQLite in tests) pass through
-    unchanged.
+    PostgreSQL URLs are re-parsed through the canonical connection contract;
+    the inherited environment is audited fail-closed and the engine is
+    built with explicit connect arguments, so the verification provably
+    reads the SAME destination the drill validated (inherited
+    ``PGHOSTADDR``/``PGSERVICE`` cannot redirect the SQLAlchemy connection,
+    and no process-global state is mutated — residual review §8).
+    Non-PostgreSQL URLs (SQLite in tests) pass through unchanged.
     """
     if (database_url or "").startswith("postgresql"):
-        effective_url = CanonicalConnection.from_url(database_url).sqlalchemy_url()
-        with scrubbed_pg_environ():
-            return _verify_battery(
-                effective_url,
-                expected=expected,
-                master_keys=master_keys,
-                active_key_id=active_key_id,
-                alembic_revision_from_manifest=alembic_revision_from_manifest,
-            )
+        canonical = CanonicalConnection.from_url(database_url)
+        canonical.audit_in_process_environment()
+        return _verify_battery(
+            canonical.sqlalchemy_url(),
+            connect_args=canonical.psycopg_connect_kwargs(),
+            expected=expected,
+            master_keys=master_keys,
+            active_key_id=active_key_id,
+            alembic_revision_from_manifest=alembic_revision_from_manifest,
+        )
     return _verify_battery(
         database_url,
         expected=expected,
@@ -450,6 +460,7 @@ def _verify_battery(
     master_keys: str | None = None,
     active_key_id: str | None = None,
     alembic_revision_from_manifest: str | None = None,
+    connect_args: Mapping[str, str] | None = None,
 ) -> DrillReport:
     """Application-level verification battery against a restored database.
 
@@ -494,7 +505,7 @@ def _verify_battery(
 
     from sqlalchemy.orm import Session
 
-    engine = create_engine(database_url)
+    engine = create_engine(database_url, connect_args=dict(connect_args or {}))
     try:
         with Session(engine) as session:
             revision = session.execute(
@@ -735,7 +746,8 @@ def run_restore_drill(
     R10: the server URL is parsed ONCE through the canonical connection
     contract; the guard, ``CREATE DATABASE``, ``pg_restore``, the
     verification battery and ``DROP DATABASE`` all derive from that same
-    parse, under a PG*-scrubbed environment.
+    parse, with explicit in-process connect arguments and a fail-closed
+    inherited-environment audit (residual review §8).
     """
     identity = Path(identity_path)
     if not identity.is_file():

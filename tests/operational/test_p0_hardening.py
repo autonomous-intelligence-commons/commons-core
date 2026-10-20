@@ -44,7 +44,7 @@ from commons_core.backup import pipeline, restore, tools
 from commons_core.backup.connection import (
     CanonicalConnection,
     ConnectionContractError,
-    scrubbed_pg_environ,
+    InProcessEnvironmentError,
 )
 from commons_core.backup.destination import (
     UnsafeDestinationError,
@@ -324,12 +324,143 @@ class TestR10EnvironmentControl:
             assert key not in env
 
     def test_scrubbed_pg_environ_removes_and_restores(self, monkeypatch):
+        """§8 residual review: the process-global scrub is GONE.
+
+        Replaced by :meth:`audit_in_process_environment` (fail-closed refusal
+        of variables the URL cannot override) plus explicit connect
+        arguments. The replacement never mutates ``os.environ``.
+        """
         monkeypatch.setenv("PGHOST", "evil.example.invalid")
         monkeypatch.setenv("PGAPPNAME", "keepme-out")
-        with scrubbed_pg_environ():
-            assert "PGHOST" not in os.environ
-            assert "PGAPPNAME" not in os.environ
-        assert os.environ["PGHOST"] == "evil.example.invalid"  # restored
+        canonical = CanonicalConnection.from_url(GOOD_URL)
+        # No mutation, no exception: PGHOST is overridden by the URL's own
+        # host (conninfo beats environment), PGAPPNAME is behavioural only.
+        canonical.audit_in_process_environment()
+        assert os.environ["PGHOST"] == "evil.example.invalid"  # untouched
+        assert not hasattr(pipeline, "scrubbed_pg_environ")
+        assert not hasattr(restore, "scrubbed_pg_environ")
+
+    @pytest.mark.parametrize(
+        "variable",
+        [
+            "PGHOSTADDR",
+            "PGSERVICE",
+            "PGSERVICEFILE",
+            "PGTARGETSESSIONATTRS",
+            "PGREQUIRESSL",
+            "PGSSLMINPROTOCOLVERSION",
+            "PGSSLMAXPROTOCOLVERSION",
+            "PGCHANNELBINDING",
+        ],
+    )
+    def test_in_process_audit_refuses_unpinnable_redirectors(self, monkeypatch, variable):
+        """§8: variables the URL can never override are a hard error —
+        PGHOSTADDR/PGSERVICE can redirect TCP even when the URL names a
+        host, so presence is refused instead of ignored (ignoring would
+        require mutating process-global state)."""
+        monkeypatch.setenv(variable, "evil")
+        canonical = CanonicalConnection.from_url(GOOD_URL)
+        with pytest.raises(InProcessEnvironmentError, match=variable):
+            canonical.audit_in_process_environment()
+        assert os.environ[variable] == "evil"  # still untouched — no scrub
+
+    def test_in_process_audit_accepts_clean_and_pinnable_environment(self, monkeypatch):
+        """PGHOST/PGPORT/PGDATABASE are always pinned by the URL authority
+        (host/port/database are mandatory), so their inherited values are
+        provably inert — no refusal, no mutation."""
+        for key, value in (
+            ("PGHOST", "elsewhere.example.invalid"),
+            ("PGPORT", "6543"),
+            ("PGDATABASE", "otherdb"),
+            ("PGAPPNAME", "ambient-app"),
+            ("PGCONNECT_TIMEOUT", "7"),
+        ):
+            monkeypatch.setenv(key, value)
+        CanonicalConnection.from_url(GOOD_URL).audit_in_process_environment()  # no raise
+
+    def test_env_password_refused_only_when_url_lacks_one(self, monkeypatch):
+        canonical = CanonicalConnection.from_url(GOOD_URL)  # has password
+        monkeypatch.setenv("PGPASSWORD", "ambient")
+        canonical.audit_in_process_environment()  # inert: URL password wins
+        no_password = CanonicalConnection.from_url("postgresql://commons@127.0.0.1:5432/db")
+        with pytest.raises(InProcessEnvironmentError, match="PGPASSWORD"):
+            no_password.audit_in_process_environment()
+
+    def test_env_passfile_refused_only_when_url_lacks_password(self, monkeypatch):
+        monkeypatch.setenv("PGPASSFILE", "/tmp/ambient-passfile")
+        CanonicalConnection.from_url(GOOD_URL).audit_in_process_environment()
+        no_password = CanonicalConnection.from_url("postgresql://commons@127.0.0.1:5432/db")
+        with pytest.raises(InProcessEnvironmentError, match="PGPASSFILE"):
+            no_password.audit_in_process_environment()
+
+    def test_env_user_refused_only_when_url_lacks_one(self, monkeypatch):
+        monkeypatch.setenv("PGUSER", "ambient-user")
+        CanonicalConnection.from_url(GOOD_URL).audit_in_process_environment()
+        no_user = CanonicalConnection.from_url("postgresql://:pw@127.0.0.1:5432/db")
+        with pytest.raises(InProcessEnvironmentError, match="PGUSER"):
+            no_user.audit_in_process_environment()
+
+    @pytest.mark.parametrize(
+        "variable,slot",
+        [
+            ("PGSSLCERT", "sslcert"),
+            ("PGSSLKEY", "sslkey"),
+            ("PGSSLPASSWORD", "sslpassword"),
+            ("PGSSLROOTCERT", "sslrootcert"),
+            ("PGSSLCRL", "sslcrl"),
+            ("PGSSLCRLDIR", "sslcrldir"),
+        ],
+    )
+    def test_env_tls_trust_material_refused_when_url_does_not_pin_it(
+        self, monkeypatch, variable, slot
+    ):
+        """Trust anchors and TLS material from the ambient environment are
+        refused unless the URL pins the matching parameter itself."""
+        monkeypatch.setenv(variable, "/tmp/ambient-tls")
+        canonical = CanonicalConnection.from_url(GOOD_URL)
+        with pytest.raises(InProcessEnvironmentError, match=variable):
+            canonical.audit_in_process_environment()
+        # Pinned by the URL → conninfo wins → the variable is inert.
+        monkeypatch.delenv(variable)
+        pinned = CanonicalConnection.from_url(GOOD_URL + f"?{slot}=/tmp/pinned-value")
+        pinned.audit_in_process_environment()  # PGSSLROOTCERT now allowed
+
+    def test_connect_kwargs_pin_sslmode_default_and_never_duplicate(self):
+        """sslmode — the one security-relevant slot the URL may leave
+        unset — is pinned to libpq's documented default so an inherited
+        PGSSLMODE can never downgrade the transport."""
+        plain = CanonicalConnection.from_url(GOOD_URL)
+        assert plain.psycopg_connect_kwargs() == {"sslmode": "prefer"}
+        with_ssl = CanonicalConnection.from_url(GOOD_URL + "?sslmode=disable")
+        assert with_ssl.psycopg_connect_kwargs() == {}  # URL already carries it
+
+    def test_backup_metadata_engine_pins_kwargs_without_env_mutation(self, monkeypatch):
+        """§8 end-to-end (unit): _source_metadata builds the engine with
+        explicit connect_args while the hostile-but-pinnable variables are
+        STILL PRESENT in os.environ (proof the scrub is gone), and the
+        audit aborts before any connection for the unpinnable ones."""
+        captured: dict = {}
+
+        class _Abort(Exception):
+            pass
+
+        def fake_create_engine(url, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            captured["env_at_build"] = dict(os.environ)
+            raise _Abort
+
+        monkeypatch.setattr(pipeline, "create_engine", fake_create_engine)
+        monkeypatch.setenv("PGHOST", "evil.example.invalid")  # pinnable: URL wins
+        monkeypatch.setenv("PGSSLMODE", "disable")  # overridden by pinned prefer
+        with pytest.raises(pipeline.PreflightError):
+            pipeline._source_metadata(GOOD_URL)  # _Abort → fail-closed preflight
+        assert captured["kwargs"]["connect_args"] == {"sslmode": "prefer"}
+        assert captured["env_at_build"]["PGHOST"] == "evil.example.invalid"  # no scrub
+
+        monkeypatch.setenv("PGHOSTADDR", "10.9.8.7")  # unpinnable: refused
+        with pytest.raises(pipeline.PreflightError, match="PGHOSTADDR"):
+            pipeline._source_metadata(GOOD_URL)
 
     def test_drill_rejects_redirecting_server_url_before_any_connection(self, tmp_path):
         identity = tmp_path / "identity.txt"
@@ -1129,3 +1260,102 @@ class TestR12RestoreCleanup:
                     database_name="aic_drill_probe07",
                 )
         drop.assert_not_called()  # nothing was created; no blind DROP issued
+
+
+# ---------------------------------------------------------------------------
+# §8 residual review — in-process connection safety against a LIVE server
+# ---------------------------------------------------------------------------
+class TestR10InProcessLivePostgres:
+    """Live-server proof that removing the process-global scrub keeps the
+    R10 invariant: pinnable inherited variables cannot redirect the
+    effective destination, unpinnable ones abort before connecting, and
+    concurrent in-process connections are thread-safe by construction.
+
+    Skipped unless ``AIC_BACKUP_TEST_ADMIN_URL`` names a reachable
+    PostgreSQL server (the same gate the backup integration suite uses).
+    """
+
+    ADMIN_URL = os.environ.get("AIC_BACKUP_TEST_ADMIN_URL", "").strip()
+    integration = pytest.mark.skipif(
+        not ADMIN_URL,
+        reason="live in-process connection tests need AIC_BACKUP_TEST_ADMIN_URL",
+    )
+
+    @integration
+    def test_pinnable_env_cannot_redirect_the_live_connection(self, monkeypatch):
+        """PGHOST/PGPORT point at a nonexistent server; the URL's own
+        authority (conninfo) wins for in-process connections exactly as it
+        does for subprocesses — and the process env is never mutated."""
+        from sqlalchemy import create_engine, text
+
+        from commons_core.backup.connection import CanonicalConnection
+
+        canonical = CanonicalConnection.from_url(self.ADMIN_URL)
+        monkeypatch.setenv("PGHOST", "no-such-host.example.invalid")
+        monkeypatch.setenv("PGPORT", "59999")
+        monkeypatch.setenv("PGSSLMODE", "require")  # would break localhost TLS
+        engine = create_engine(
+            canonical.sqlalchemy_url(),
+            connect_args=canonical.psycopg_connect_kwargs(),
+        )
+        try:
+            with engine.connect() as conn:
+                db = conn.execute(text("SELECT current_database()")).scalar_one()
+                assert db == canonical.database_name
+        finally:
+            engine.dispose()
+        # The hostile variables are still in place — never scrubbed.
+        assert os.environ["PGHOST"] == "no-such-host.example.invalid"
+        assert os.environ["PGPORT"] == "59999"
+
+    @integration
+    def test_unpinnable_env_aborts_the_live_preflight_before_connecting(self, monkeypatch):
+        monkeypatch.setenv("PGHOSTADDR", "127.0.0.2")
+        with pytest.raises(pipeline.PreflightError, match="PGHOSTADDR"):
+            pipeline._source_metadata(self.ADMIN_URL)
+        monkeypatch.delenv("PGHOSTADDR")
+        monkeypatch.setenv("PGSERVICE", "ambient-service")
+        with pytest.raises(pipeline.PreflightError, match="PGSERVICE"):
+            pipeline._source_metadata(self.ADMIN_URL)
+
+    @integration
+    def test_concurrent_in_process_connections_are_thread_safe(self, monkeypatch):
+        """Two threads connect in-process simultaneously while hostile
+        pinnable variables sit in the shared environment. With the former
+        process-global scrub this was a data race (one thread could see
+        another's restored variables mid-connection); with explicit
+        parameters every thread resolves the same pinned destination."""
+
+        from sqlalchemy import create_engine, text
+
+        from commons_core.backup.connection import CanonicalConnection
+
+        monkeypatch.setenv("PGHOST", "no-such-host.example.invalid")
+        monkeypatch.setenv("PGPORT", "59999")
+        canonical = CanonicalConnection.from_url(self.ADMIN_URL)
+        kwargs = canonical.psycopg_connect_kwargs()
+        barrier = threading.Barrier(2)
+        failures: list[str] = []
+
+        def worker() -> None:
+            try:
+                barrier.wait(timeout=10)
+                engine = create_engine(canonical.sqlalchemy_url(), connect_args=kwargs)
+                try:
+                    with engine.connect() as conn:
+                        db = conn.execute(text("SELECT current_database()")).scalar_one()
+                        if db != canonical.database_name:
+                            failures.append(f"wrong database {db!r}")
+                finally:
+                    engine.dispose()
+            except Exception as exc:  # noqa: BLE001 — record, never hang the test
+                failures.append(f"{type(exc).__name__}: {exc}")
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        assert not failures
+        # The shared environment was read-only for the whole drill.
+        assert os.environ["PGHOST"] == "no-such-host.example.invalid"

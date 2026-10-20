@@ -32,8 +32,8 @@ and exports for disaster recovery, with the same never-a-secret-in-argv rules.
 from .connection import (
     CanonicalConnection,
     ConnectionContractError,
+    InProcessEnvironmentError,
     canonical_from_url,
-    scrubbed_pg_environ,
 )
 from .destination import (
     UnsafeDestinationError,
@@ -117,11 +117,11 @@ __all__ = [
     # safety helpers
     "CanonicalConnection",
     "ConnectionContractError",
+    "InProcessEnvironmentError",
     "UnsafeDestinationError",
     "canonical_from_url",
     "describe_url",
     "scrub_secrets",
-    "scrubbed_pg_environ",
     "validate_restore_destination",
     # recovery custody (Stage 2)
     "AgeIdentity",

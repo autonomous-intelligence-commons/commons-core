@@ -65,7 +65,6 @@ from .age_format import AgeFormatError, verify_age_file
 from .connection import (
     CanonicalConnection,
     ConnectionContractError,
-    scrubbed_pg_environ,
 )
 from .destination import describe_url, scrub_secrets
 from .manifest import (
@@ -197,40 +196,49 @@ def _source_metadata(database_url: str) -> tuple[dict, str | None, int]:
     They are recorded as informational context — not as proof that the dump
     contains exactly this schema version. See ``manifest.py``.
 
-    R10: the engine is built from the canonical URL and the inherited
-    ``PG*`` environment is scrubbed for the duration of the read, so the
-    metadata query provably hits the connection the caller named.
+    R10: the engine is built from the canonical URL with explicit connect
+    arguments, and the inherited environment is audited fail-closed first
+    (variables the URL cannot override — ``PGHOSTADDR``/``PGSERVICE``… —
+    abort the preflight). The metadata query provably hits the connection
+    the caller named without mutating process-global state (residual
+    review §8).
     """
     try:
         canonical = CanonicalConnection.from_url(database_url)
     except ConnectionContractError as exc:
         raise PreflightError(f"backup database URL rejected: {exc}") from exc
     try:
-        with scrubbed_pg_environ():
-            engine = create_engine(canonical.sqlalchemy_url(), pool_pre_ping=True)
-            try:
-                with engine.connect() as conn:
-                    server_version = conn.execute(text("SELECT version()")).scalar_one()
-                    database_name = conn.execute(text("SELECT current_database()")).scalar_one()
-                    try:
-                        alembic_revision: str | None = conn.execute(
-                            text("SELECT version_num FROM alembic_version")
-                        ).scalar_one_or_none()
-                    except Exception:  # noqa: BLE001 — unmigrated database: honest "unknown"
-                        alembic_revision = None
-                    major = postgres_major(str(server_version))
-                    return (
-                        {
-                            "server_version": str(server_version),
-                            "database_name": str(database_name),
-                        },
-                        alembic_revision,
-                        major,
-                    )
-            finally:
-                engine.dispose()
+        canonical.audit_in_process_environment()
+        engine = create_engine(
+            canonical.sqlalchemy_url(),
+            connect_args=canonical.psycopg_connect_kwargs(),
+            pool_pre_ping=True,
+        )
+        try:
+            with engine.connect() as conn:
+                server_version = conn.execute(text("SELECT version()")).scalar_one()
+                database_name = conn.execute(text("SELECT current_database()")).scalar_one()
+                try:
+                    alembic_revision: str | None = conn.execute(
+                        text("SELECT version_num FROM alembic_version")
+                    ).scalar_one_or_none()
+                except Exception:  # noqa: BLE001 — unmigrated database: honest "unknown"
+                    alembic_revision = None
+                major = postgres_major(str(server_version))
+                return (
+                    {
+                        "server_version": str(server_version),
+                        "database_name": str(database_name),
+                    },
+                    alembic_revision,
+                    major,
+                )
+        finally:
+            engine.dispose()
     except PreflightError:
         raise
+    except ConnectionContractError as exc:
+        raise PreflightError(f"backup environment rejected: {exc}") from exc
     except Exception as exc:  # noqa: BLE001 — any connection failure is a fail-closed preflight error
         raise PreflightError(
             f"cannot read source metadata from {describe_url(database_url)} "
