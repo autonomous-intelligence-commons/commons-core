@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -111,14 +112,23 @@ def make_toolbelt() -> Toolbelt:
     return Toolbelt(age=AGE_BIN, pg_dump=PG_DUMP_BIN, pg_restore=PG_RESTORE_BIN)
 
 
-def app_url_for(db_name: str) -> str:
+def app_url_for(db_name: str, scheme: str | None = None) -> str:
+    """App-role URL for a database (carries the synthetic credentials).
+
+    ``scheme`` forces a URL spelling (``postgresql`` or
+    ``postgresql+psycopg``); by default the admin URL's own scheme is
+    kept — both spellings must behave identically everywhere.
+    """
     from urllib.parse import urlsplit, urlunsplit
 
     parts = urlsplit(ADMIN_URL)
+    netloc = f"{APP_ROLE}:{APP_PASSWORD}@{parts.hostname}" + (
+        f":{parts.port}" if parts.port else ""
+    )
     return urlunsplit(
         parts._replace(
-            netloc=f"{APP_ROLE}:{APP_PASSWORD}@{parts.hostname}"
-            + (f":{parts.port}" if parts.port else ""),
+            scheme=scheme or parts.scheme,
+            netloc=netloc,
             path=f"/{db_name}",
         )
     )
@@ -184,11 +194,13 @@ def make_identity(directory: Path) -> tuple[Path, str]:
     return identity, recipient
 
 
-def build_synthetic_source(prefix: str = "aic_test") -> tuple[str, str, dict]:
+def build_synthetic_source(
+    prefix: str = "aic_test", scheme: str | None = None
+) -> tuple[str, str, dict]:
     """Create a migrated, populated synthetic database; return (url, keys, facts)."""
     db_name = f"{prefix}_{secrets.token_hex(4)}"
     admin_create_db(db_name)
-    url = app_url_for(db_name)
+    url = app_url_for(db_name, scheme=scheme)
     master_keys = random_master_key()
     try:
         alembic_upgrade(url)
@@ -288,19 +300,71 @@ def test_run_backup_refuses_private_identity_as_recipient(tmp_path):
         )
 
 
-def test_describe_url_never_leaks_password():
-    described = describe_url("postgresql://commons:supersecret@127.0.0.1:5432/aic_test_x")
-    assert "supersecret" not in described
-    assert "commons@127.0.0.1:5432/aic_test_x" in described
+@pytest.mark.parametrize(
+    ("scheme", "expected"),
+    [
+        ("postgresql", "postgresql://db.internal.example.com:5433/prod"),
+        (
+            "postgresql+psycopg",
+            "postgresql+psycopg://db.internal.example.com:5433/prod",
+        ),
+    ],
+    ids=["plain-scheme", "psycopg-scheme"],
+)
+def test_describe_url_drops_identity_material(scheme, expected):
+    """Both accepted scheme spellings: the username, password, and query
+    string are dropped entirely; scheme/host/port/database survive.
+
+    Stage 2 review correction — database usernames are barred from
+    operational output just like passwords, and the bare scheme prefix
+    of the credential-free description is explicitly NOT a leak.
+    """
+    url = f"{scheme}://svc_backup:hunter2@db.internal.example.com:5433/prod?sslmode=require"
+    described = describe_url(url)
+    assert described == expected
+    assert "hunter2" not in described
+    assert "svc_backup" not in described
+    assert "sslmode" not in described
+    assert "@" not in described
 
 
-def test_scrub_secrets_redacts_urls_and_hex64():
-    text = "connect to postgresql://u:p@h/db failed with key abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+@pytest.mark.parametrize(
+    "scheme", ["postgresql", "postgresql+psycopg"], ids=["plain-scheme", "psycopg-scheme"]
+)
+def test_describe_url_handles_userinfo_free_urls(scheme):
+    """URLs without any userinfo describe to themselves (nothing to drop)."""
+    assert (
+        describe_url(f"{scheme}://127.0.0.1:5433/aic_drill_ab12cd34")
+        == f"{scheme}://127.0.0.1:5433/aic_drill_ab12cd34"
+    )
+
+
+@pytest.mark.parametrize(
+    "scheme", ["postgresql", "postgresql+psycopg"], ids=["plain-scheme", "psycopg-scheme"]
+)
+def test_scrub_secrets_redacts_urls_and_hex64(scheme):
+    text = (
+        f"connect to {scheme}://u:p@h/db failed with key "
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    )
     scrubbed = scrub_secrets(text)
     assert "p@h" not in scrubbed
+    assert "***:***@" in scrubbed
     assert "abcdef0123" not in scrubbed
     scrubbed2 = scrub_secrets("leak the password", extra_secrets=("the password",))
     assert "the password" not in scrubbed2 and "***REDACTED***" in scrubbed2
+
+
+def test_scrub_secrets_redacts_known_username_in_tool_stderr():
+    """PostgreSQL echoes the USERNAME inside its own failure text (e.g.
+    ``FATAL: password authentication failed for user …``); the failure
+    paths hand the run's libpq credentials to the scrubber so neither the
+    username nor the password can survive (Stage 2 review correction)."""
+    stderr = 'FATAL: password authentication failed for user "svc_backup"'
+    scrubbed = scrub_secrets(stderr, extra_secrets=("sup3r-s3cret", "svc_backup"))
+    assert "svc_backup" not in scrubbed
+    assert "sup3r-s3cret" not in scrubbed
+    assert scrubbed == 'FATAL: password authentication failed for user "***REDACTED***"'
 
 
 def test_pg_env_from_url_keeps_credentials_out_of_argv():
@@ -575,13 +639,13 @@ def test_no_private_keys_in_tracked_files():
     """Scan every tracked file for real age identities / PEM private keys.
 
     The patterns are deliberately STRICT — they match actual key material
-    (a base32 body, a complete PEM header), not documentation that merely
+    (a bech32 body (data part may contain 0-9), a complete PEM header), not documentation that merely
     describes the format. Documentation legitimately contains strings
     like ``AGE-SECRET-KEY-1…``; a committed key never would.
     """
     import re
 
-    age_identity_re = re.compile(r"AGE-SECRET-KEY-1[A-Z2-7]{10,}")
+    age_identity_re = re.compile(r"AGE-SECRET-KEY-1[A-Z0-9]{10,}")  # bech32 data part (0-9 allowed)
     pem_private_re = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
     proc = subprocess.run(
         ["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
@@ -661,8 +725,31 @@ class TestEndToEndBackupAndDrill:
         finally:
             admin_drop_db(source_url.rsplit("/", 1)[-1])
 
+    @staticmethod
+    def _assert_operational_output_is_credential_free(combined: str, source_url: str) -> None:
+        """The real operational-output invariant, scheme-agnostic.
+
+        What must NEVER appear: the password, the database username, the
+        verbatim credentialed URL, or any URL-userinfo shape. What is
+        explicitly NOT a leak: the bare ``postgresql://`` or
+        ``postgresql+psycopg://`` prefix of the credential-free description
+        the pipeline prints (the OLD assertion here — ``"postgresql://"
+        not in combined`` — treated the harmless scheme substring itself
+        as a leak, which made the test pass or fail depending only on
+        which spelling the environment happened to use; Stage 2 review
+        correction).
+        """
+        assert APP_PASSWORD not in combined, "password in operational output"
+        assert APP_ROLE not in combined, "database username in operational output"
+        assert source_url not in combined, "verbatim credentialed URL echoed"
+        assert not re.search(r"://[^/@\s]+@", combined), "URL userinfo in operational output"
+        # Sanity: the credential-free description IS what got printed —
+        # operational context is preserved, only identity material is gone.
+        assert describe_url(source_url) in combined
+
     def test_cli_output_has_no_credentials(self, tmp_path, capsys):
-        """Operational safeguard: stdout/stderr never contain secrets."""
+        """Operational safeguard: stdout/stderr never contain secret material
+        (under the environment's own scheme spelling)."""
 
         source_url, master_keys, facts = build_synthetic_source()
         storage = LocalFilesystemStorage(tmp_path / "storage")
@@ -675,9 +762,38 @@ class TestEndToEndBackupAndDrill:
                 work_dir=tmp_path / "work",
             )
             captured = capsys.readouterr()
-            combined = captured.out + captured.err
-            assert APP_PASSWORD not in combined
-            assert "postgresql://" not in combined  # URLs are described, not printed
+            self._assert_operational_output_is_credential_free(
+                captured.out + captured.err, source_url
+            )
+        finally:
+            admin_drop_db(source_url.rsplit("/", 1)[-1])
+
+    def test_cli_output_has_no_credentials_other_scheme(self, tmp_path, capsys):
+        """Same invariant under the OTHER accepted scheme spelling.
+
+        Together with the sibling test this guarantees BOTH
+        ``postgresql://`` and ``postgresql+psycopg://`` are exercised in
+        every environment, regardless of which spelling the admin URL
+        uses (CI uses +psycopg; a plain-scheme local run is the case that
+        originally produced the false positive).
+        """
+        from urllib.parse import urlsplit
+
+        other = "postgresql" if urlsplit(ADMIN_URL).scheme != "postgresql" else "postgresql+psycopg"
+        source_url, master_keys, facts = build_synthetic_source(scheme=other)
+        storage = LocalFilesystemStorage(tmp_path / "storage")
+        identity, recipient = make_identity(tmp_path)
+        try:
+            run_backup(
+                database_url=source_url,
+                recipient=recipient,
+                storage=storage,
+                work_dir=tmp_path / "work",
+            )
+            captured = capsys.readouterr()
+            self._assert_operational_output_is_credential_free(
+                captured.out + captured.err, source_url
+            )
         finally:
             admin_drop_db(source_url.rsplit("/", 1)[-1])
 
@@ -801,6 +917,44 @@ class TestPipelineFailureInjection:
                 )
             assert list((tmp_path / "work").rglob("*.part")) == []
             assert not storage.list_backup_ids()
+        finally:
+            admin_drop_db(source_url.rsplit("/", 1)[-1])
+
+    def test_dump_failure_detail_redacts_libpq_credentials(self, tmp_path):
+        """A failing pg_dump whose stderr echoes PGUSER/PGPASSWORD must
+        surface only scrubbed text — the USERNAME is exactly as barred
+        from operational output as the password (Stage 2 review
+        correction, requirement 3)."""
+        fake = write_fake_tool(
+            tmp_path,
+            "fake-pg-dump-echo-creds",
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            "if '--version' in sys.argv:\n"
+            "    print('pg_dump (PostgreSQL) 18.6 (fake)')\n"
+            "    sys.exit(0)\n"
+            "user = os.environ.get('PGUSER', '?')\n"
+            "pw = os.environ.get('PGPASSWORD', '?')\n"
+            "sys.stderr.write(f'connect user={user} pw={pw} failed\\n')\n"
+            "sys.exit(2)\n",
+        )
+        storage = LocalFilesystemStorage(tmp_path / "storage")
+        identity, recipient = make_identity(tmp_path)
+        source_url, _, _ = build_synthetic_source()
+        belt = Toolbelt(age=AGE_BIN, pg_dump=fake, pg_restore=PG_RESTORE_BIN)
+        try:
+            with pytest.raises(DumpFailed) as exc_info:
+                run_backup(
+                    database_url=source_url,
+                    recipient=recipient,
+                    storage=storage,
+                    work_dir=tmp_path / "work",
+                    toolbelt=belt,
+                )
+            message = str(exc_info.value)
+            assert APP_PASSWORD not in message, "password in failure detail"
+            assert APP_ROLE not in message, "username in failure detail"
+            assert "***REDACTED***" in message
         finally:
             admin_drop_db(source_url.rsplit("/", 1)[-1])
 

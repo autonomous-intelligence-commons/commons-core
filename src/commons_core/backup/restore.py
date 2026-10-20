@@ -6,7 +6,7 @@ production-looking destinations by construction (see
 automatic production restore command (ADR-0009).
 
 Flow (every step is a gate — the first failure stops the drill; cleanup
-always runs):
+always runs and its outcome is REPORTED):
 
 1. destination guard: the server host must be loopback/private, the
    target database name must look disposable (or be explicitly
@@ -30,6 +30,25 @@ always runs):
 7. emit a machine-readable report: PASS/FAIL per check, counts and
    labels only — never message/memory content, never credentials.
 
+R10 — the validated destination IS the effective connection: the drill
+parses the server URL once through the canonical connection contract
+(:mod:`commons_core.backup.connection`) and derives EVERY connection from
+that single parse — ``CREATE DATABASE``, the ``pg_restore`` subprocess,
+the verification battery, and ``DROP DATABASE``. In-process connections
+are built with explicit connect arguments after a fail-closed environment
+audit (no process-global mutation — residual review §8), and the
+subprocess receives the fully-controlled child environment. Query-string
+overrides like ``?host=…`` are rejected before anything connects.
+
+R12 — cleanup is explicit, bounded and verifiable: ``_drop_database`` no
+longer swallows failures (T11); it RAISES :class:`DrillCleanupError`, the
+report records a dedicated ``cleanup_state``/``cleanup_detail``, a failed
+cleanup demotes the drill to FAILED (a drill with unhandled residue never
+claims complete success — D14), and when a primary failure is already
+propagating the cleanup failure is chained onto it so both are visible.
+Both drill subprocesses wait under a total deadline, run in their own
+process group, and their stderr capture is size-bounded.
+
 A non-zero pg_restore exit is a failure even if objects were already
 created in the target — they are destroyed with the dropped database.
 """
@@ -39,12 +58,18 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import sys
+from collections import deque
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 
 from sqlalchemy import create_engine, select, text
 
+from .connection import (
+    CanonicalConnection,
+    ConnectionContractError,
+)
 from .destination import (
     UnsafeDestinationError,
     describe_url,
@@ -53,11 +78,29 @@ from .destination import (
 )
 from .manifest import BackupManifest, sha256_file
 from .storage import StorageAdapter
-from .tools import Toolbelt, locate_toolbelt, postgres_major
+from .tools import (
+    STDERR_MAX_LINES,
+    Toolbelt,
+    locate_toolbelt,
+    postgres_major,
+    start_new_session_flag,
+    subprocess_deadline_seconds,
+    terminate_process_tree,
+)
 
 
 class DrillFailure(RuntimeError):
     """The restore drill failed — see the report for the failing gate."""
+
+
+class DrillCleanupError(RuntimeError):
+    """Cleanup of the disposable drill database FAILED (R12 / T11).
+
+    Never swallowed: the drill report surfaces it as an explicit
+    incomplete-cleanup condition, and the disposable database may still
+    exist on the server — the message says exactly that. The message is
+    credential-free (exception type names only, scrubbed text).
+    """
 
 
 @dataclass(frozen=True)
@@ -74,10 +117,17 @@ class DrillCheck:
 
 @dataclass
 class DrillReport:
+    """Drill outcome. R12: cleanup is a REPORTED dimension, not an
+    afterthought — ``cleanup_state`` records what actually happened to the
+    disposable database, and a failed cleanup forces ``passed=False``.
+    """
+
     backup_id: str
     database_name: str
     passed: bool = False
     checks: list[DrillCheck] = field(default_factory=list)
+    cleanup_state: str = "pending"
+    cleanup_detail: str = ""
 
     def add(self, label: str, passed: bool, detail: str = "") -> bool:
         self.checks.append(DrillCheck(label=label, passed=passed, detail=detail))
@@ -88,6 +138,8 @@ class DrillReport:
             "backup_id": self.backup_id,
             "database_name": self.database_name,
             "passed": self.passed,
+            "cleanup_state": self.cleanup_state,
+            "cleanup_detail": self.cleanup_detail,
             "checks": [asdict(c) for c in self.checks],
         }
         return json.dumps(payload, indent=2, sort_keys=True)
@@ -96,28 +148,35 @@ class DrillReport:
         lines = [c.render() for c in self.checks]
         verdict = "PASS" if self.passed else "FAIL"
         lines.append(f"DRILL-{verdict} backup_id={self.backup_id} database={self.database_name}")
+        lines.append(f"CLEANUP-{self.cleanup_state.upper()} {self.cleanup_detail}".rstrip())
         return "\n".join(lines)
 
 
-def _admin_url(server_url: str) -> str:
-    """Rewrite any server URL to its maintenance database (…/postgres)."""
-    parts = urlsplit(server_url)
-    if not parts.path.lstrip("/"):
-        raise DrillFailure(
-            "server URL must name a maintenance database (e.g. …/postgres) so the "
-            "drill can create and drop the disposable target"
-        )
-    return urlunsplit(parts._replace(path="/postgres"))
+def _admin_connection(server_url: str) -> CanonicalConnection:
+    """The server's maintenance-database connection (canonical, R10).
 
-
-def _target_url(server_url: str, database_name: str) -> str:
-    parts = urlsplit(server_url)
-    return urlunsplit(parts._replace(path=f"/{database_name}"))
+    Parses the operator-supplied server URL ONCE through the canonical
+    contract; every admin operation (CREATE/DROP) and the target itself is
+    derived from this same parse, so the guard and the effective
+    connections cannot diverge.
+    """
+    try:
+        canonical = CanonicalConnection.from_url(server_url)
+    except ConnectionContractError as exc:
+        raise DrillFailure(f"server URL rejected by the connection contract: {exc}") from exc
+    return canonical.with_database("postgres")
 
 
 def _create_database(server_url: str, name: str) -> None:
-    engine = create_engine(_admin_url(server_url), isolation_level="AUTOCOMMIT")
+    admin = _admin_connection(server_url)
+    engine = None
     try:
+        admin.audit_in_process_environment()
+        engine = create_engine(
+            admin.sqlalchemy_url(),
+            connect_args=admin.psycopg_connect_kwargs(),
+            isolation_level="AUTOCOMMIT",
+        )
         with engine.connect() as conn:
             exists = conn.execute(
                 text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": name}
@@ -136,12 +195,31 @@ def _create_database(server_url: str, name: str) -> None:
             f"CREATEDB? {type(exc).__name__})"
         ) from exc
     finally:
-        engine.dispose()
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception:  # noqa: BLE001 — dispose must not mask the gate failure
+                pass
 
 
 def _drop_database(server_url: str, name: str) -> None:
-    engine = create_engine(_admin_url(server_url), isolation_level="AUTOCOMMIT")
+    """Drop the disposable database and VERIFY its absence (R12 / T11).
+
+    The Stage 1 defect (T11) swallowed every exception here, so a failed
+    DROP was reported as success and a database with private synthetic
+    data could silently remain. Failures now RAISE
+    :class:`DrillCleanupError` — the drill turns that into an explicit
+    incomplete-cleanup report line and a FAIL verdict.
+    """
+    admin = _admin_connection(server_url)
+    engine = None
     try:
+        admin.audit_in_process_environment()
+        engine = create_engine(
+            admin.sqlalchemy_url(),
+            connect_args=admin.psycopg_connect_kwargs(),
+            isolation_level="AUTOCOMMIT",
+        )
         with engine.connect() as conn:
             conn.execute(
                 text(
@@ -151,31 +229,38 @@ def _drop_database(server_url: str, name: str) -> None:
                 {"n": name},
             )
             conn.execute(text(f'DROP DATABASE IF EXISTS "{name}"'))
-    except Exception:  # noqa: BLE001 — best-effort cleanup; drop failures re-raised by caller if fatal
-        pass
+            still_exists = conn.execute(
+                text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": name}
+            ).scalar()
+        if still_exists:
+            raise DrillCleanupError(
+                f"disposable database {name!r} STILL EXISTS after DROP — cleanup "
+                "unconfirmed; inspect the server and drop it manually after review"
+            )
+    except DrillCleanupError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — cleanup failure, EXPLICIT (R12/T11)
+        raise DrillCleanupError(
+            f"cleanup of disposable database {name!r} failed ({type(exc).__name__}) — "
+            "it may remain on the server; drop it manually after review"
+        ) from exc
     finally:
-        engine.dispose()
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception:  # noqa: BLE001 — dispose must not mask the drop failure
+                pass
 
 
 def _libpq_env(target_url: str, *, inherit: bool = True) -> dict[str, str]:
-    """Connection parameters as libpq environment variables (no argv secrets)."""
-    parts = urlsplit(target_url)
-    env = (
-        dict(os.environ)
-        if inherit
-        else {k: v for k, v in os.environ.items() if not k.startswith("PG")}
-    )
-    if parts.hostname:
-        env["PGHOST"] = unquote(parts.hostname)
-    if parts.port:
-        env["PGPORT"] = str(parts.port)
-    if parts.username:
-        env["PGUSER"] = unquote(parts.username)
-    if parts.password:
-        env["PGPASSWORD"] = unquote(parts.password)
-    for key, value in parse_qsl(parts.query):
-        env[f"PG{key.upper().replace('-', '_')}"] = value
-    return env
+    """DEPRECATED shim kept for callers/tests: the canonical child env.
+
+    R10: the environment for ``pg_restore`` is now derived from the SAME
+    canonical parse as the destination guard — inherited ``PG*`` variables
+    are stripped and connection-redirecting URL parameters are rejected.
+    """
+    del inherit  # the canonical env never inherits PG* overrides
+    return CanonicalConnection.from_url(target_url).subprocess_env(app_name="commons-core-drill")
 
 
 def _stream_decrypt_restore(
@@ -191,11 +276,25 @@ def _stream_decrypt_restore(
     archive from stdin when no archive file argument is given. Connection
     parameters travel as libpq env vars; argv carries only the public
     database NAME.
+
+    R10: the child environment is the canonical one — inherited ``PG*``
+    variables are stripped and redirecting query parameters were rejected
+    when the target URL was parsed, so pg_restore connects to exactly the
+    validated destination.
+
+    R12: both waits are bounded by the total deadline, the processes run in
+    their own process group (where supported), stderr capture is
+    size-bounded, and termination is graceful-then-forced with the outcome
+    reported in the returned detail.
     """
     import subprocess
     import threading
 
-    target_db = unquote(urlsplit(target_url).path.lstrip("/"))
+    try:
+        canonical = CanonicalConnection.from_url(target_url)
+    except ConnectionContractError as exc:
+        return False, f"target URL rejected by the connection contract: {exc}"
+    target_db = canonical.database_name
     age_argv = [belt.age, "-d", "-i", str(identity_path)]
     restore_argv = [
         belt.pg_restore,
@@ -206,27 +305,45 @@ def _stream_decrypt_restore(
     ]
 
     age_proc = restore_proc = None
-    age_err: list[str] = []
-    restore_err: list[str] = []
+    age_err: deque = deque(maxlen=STDERR_MAX_LINES)
+    restore_err: deque = deque(maxlen=STDERR_MAX_LINES)
 
-    def pump(stream, sink: list[str]) -> None:
+    def pump(stream, sink: deque) -> None:
         try:
             for line in iter(stream.readline, b""):
                 sink.append(line.decode("utf-8", "replace"))
         finally:
             stream.close()
 
+    def _wait_bounded(proc, label: str) -> tuple[int | None, str]:
+        try:
+            return proc.wait(timeout=subprocess_deadline_seconds()), ""
+        except subprocess.TimeoutExpired:
+            note = terminate_process_tree(proc, label=label)
+            detail = f" {note}" if note else ""
+            return (
+                None,
+                f"{label} did not exit within its "
+                f"{subprocess_deadline_seconds():.0f}s deadline — process tree "
+                f"terminated; the restore is incomplete{detail}",
+            )
+
     try:
         with open(artifact, "rb") as artifact_fh:
             age_proc = subprocess.Popen(
-                age_argv, stdin=artifact_fh, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                age_argv,
+                stdin=artifact_fh,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=start_new_session_flag(),
             )
             restore_proc = subprocess.Popen(
                 restore_argv,
                 stdin=age_proc.stdout,  # type: ignore[arg-type]
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                env=_libpq_env(target_url),
+                env=canonical.subprocess_env(app_name="commons-core-drill"),
+                start_new_session=start_new_session_flag(),
             )
             age_proc.stdout.close()  # type: ignore[union-attr]
         threads = [
@@ -235,16 +352,33 @@ def _stream_decrypt_restore(
         ]
         for thread in threads:
             thread.start()
-        age_rc = age_proc.wait()
-        restore_rc = restore_proc.wait()
+        age_rc, age_timeout = _wait_bounded(age_proc, "age")
+        if age_rc is None:
+            return False, age_timeout
+        restore_rc, restore_timeout = _wait_bounded(restore_proc, "pg_restore")
+        if restore_rc is None:
+            return False, restore_timeout
         for thread in threads:
             thread.join(timeout=5)
 
+        # Hand the target URL's libpq credentials to the scrubber: neither
+        # the password nor the USERNAME may survive in failure detail text
+        # (PostgreSQL's own errors echo the role name). R10: the values come
+        # from the canonical parse (already unquoted, already validated).
+        known_credentials = (
+            canonical.password or "",
+            canonical.user or "",
+        )
+
         if age_rc != 0:
-            detail = scrub_secrets("".join(age_err[-6:]).strip())
+            detail = scrub_secrets(
+                "".join(list(age_err)[-6:]).strip(), extra_secrets=known_credentials
+            )
             return False, f"age decrypt failed with status {age_rc}: {detail or '(no stderr)'}"
         if restore_rc != 0:
-            detail = scrub_secrets("".join(restore_err[-10:]).strip())
+            detail = scrub_secrets(
+                "".join(list(restore_err)[-10:]).strip(), extra_secrets=known_credentials
+            )
             return False, (
                 f"pg_restore failed with status {restore_rc} (objects created before "
                 f"the failure are destroyed with the dropped database): "
@@ -252,10 +386,17 @@ def _stream_decrypt_restore(
             )
         return True, ""
     finally:
-        for proc in (age_proc, restore_proc):
+        notes: list[str] = []
+        for proc, label in ((age_proc, "age"), (restore_proc, "pg_restore")):
             if proc is not None and proc.poll() is None:
-                proc.kill()
-                proc.wait()
+                note = terminate_process_tree(proc, label=label)
+                if note:
+                    notes.append(note)
+        if notes:  # pragma: no cover — pathological reap failure
+            print(
+                "[drill] WARNING: incomplete process cleanup — " + "; ".join(notes),
+                file=sys.stderr,
+            )
 
 
 def _build_cipher(master_keys: str | None, active_key_id: str | None):
@@ -281,6 +422,45 @@ def verify_restored_database(
     master_keys: str | None = None,
     active_key_id: str | None = None,
     alembic_revision_from_manifest: str | None = None,
+) -> DrillReport:
+    """Application-level verification battery — R10 entry point.
+
+    PostgreSQL URLs are re-parsed through the canonical connection contract;
+    the inherited environment is audited fail-closed and the engine is
+    built with explicit connect arguments, so the verification provably
+    reads the SAME destination the drill validated (inherited
+    ``PGHOSTADDR``/``PGSERVICE`` cannot redirect the SQLAlchemy connection,
+    and no process-global state is mutated — residual review §8).
+    Non-PostgreSQL URLs (SQLite in tests) pass through unchanged.
+    """
+    if (database_url or "").startswith("postgresql"):
+        canonical = CanonicalConnection.from_url(database_url)
+        canonical.audit_in_process_environment()
+        return _verify_battery(
+            canonical.sqlalchemy_url(),
+            connect_args=canonical.psycopg_connect_kwargs(),
+            expected=expected,
+            master_keys=master_keys,
+            active_key_id=active_key_id,
+            alembic_revision_from_manifest=alembic_revision_from_manifest,
+        )
+    return _verify_battery(
+        database_url,
+        expected=expected,
+        master_keys=master_keys,
+        active_key_id=active_key_id,
+        alembic_revision_from_manifest=alembic_revision_from_manifest,
+    )
+
+
+def _verify_battery(
+    database_url: str,
+    *,
+    expected: dict | None = None,
+    master_keys: str | None = None,
+    active_key_id: str | None = None,
+    alembic_revision_from_manifest: str | None = None,
+    connect_args: Mapping[str, str] | None = None,
 ) -> DrillReport:
     """Application-level verification battery against a restored database.
 
@@ -325,7 +505,7 @@ def verify_restored_database(
 
     from sqlalchemy.orm import Session
 
-    engine = create_engine(database_url)
+    engine = create_engine(database_url, connect_args=dict(connect_args or {}))
     try:
         with Session(engine) as session:
             revision = session.execute(
@@ -557,9 +737,18 @@ def run_restore_drill(
     Gates, in order: destination guard → commit marker → manifest →
     artifact hash → client/server version compatibility → streamed
     decrypt+restore → application battery. Cleanup (drop target) runs on
-    every path unless ``keep_database`` is set.
+    every path unless ``keep_database`` is set — and its OUTCOME is
+    recorded in the report (R12): ``cleanup_state`` is ``dropped`` only
+    when the database is verifiably gone; a cleanup failure demotes the
+    drill to FAIL and (when a primary failure is already propagating) is
+    chained onto it so both failures stay visible.
+
+    R10: the server URL is parsed ONCE through the canonical connection
+    contract; the guard, ``CREATE DATABASE``, ``pg_restore``, the
+    verification battery and ``DROP DATABASE`` all derive from that same
+    parse, with explicit in-process connect arguments and a fail-closed
+    inherited-environment audit (residual review §8).
     """
-    belt = toolbelt or locate_toolbelt()
     identity = Path(identity_path)
     if not identity.is_file():
         raise DrillFailure(f"age identity file not found: {identity}")
@@ -567,8 +756,19 @@ def run_restore_drill(
     if expected_facts_path and not expected_facts:
         expected_facts = json.loads(Path(expected_facts_path).read_text(encoding="utf-8"))
 
-    target_name = database_name or f"aic_drill_{secrets.token_hex(4)}"
-    target_url = _target_url(server_url, target_name)
+    # Single canonical parse of the operator-supplied server URL (R10): the
+    # destination guard and every effective connection below derive from it.
+    # This check runs BEFORE tool discovery — an unsafe or malformed URL is
+    # rejected without touching anything else (fail-closed ordering).
+    try:
+        server_conn = CanonicalConnection.from_url(server_url)
+    except ConnectionContractError as exc:
+        raise DrillFailure(f"server URL rejected by the connection contract: {exc}") from exc
+    belt = toolbelt or locate_toolbelt()
+    target_conn = server_conn.with_database(database_name or f"aic_drill_{secrets.token_hex(4)}")
+    target_name = target_conn.database_name
+    target_url = target_conn.sqlalchemy_url()
+
     try:
         validate_restore_destination(
             target_url,
@@ -622,7 +822,11 @@ def run_restore_drill(
         raise DrillFailure(str(exc)) from exc
 
     report = DrillReport(backup_id=backup_id, database_name=target_name)
-    report.add("destination validated as disposable", True, describe_url(target_url))
+    report.add(
+        "destination validated as disposable",
+        True,
+        f"{describe_url(target_url)} — effective connection = validated connection (R10)",
+    )
     report.add("commit marker present", True)
     report.add("artifact sha256 matches manifest", True, f"sha={actual_sha[:12]}…")
     report.add(
@@ -632,6 +836,7 @@ def run_restore_drill(
     )
 
     if keep_database:
+        report.cleanup_state = "kept-for-debug"
         report.add(
             "keep-database override ACTIVE — disposable database NOT dropped",
             True,
@@ -665,5 +870,44 @@ def run_restore_drill(
         report.passed = all(check.passed for check in report.checks)
         return report
     finally:
-        if created and not keep_database:
-            _drop_database(server_url, target_name)
+        # R12: cleanup outcome is OBSERVED and REPORTED, never assumed.
+        if not created:
+            if not keep_database:
+                report.cleanup_state = "not-created"
+        elif keep_database:
+            pass  # explicit debug override; already recorded above
+        else:
+            cleanup_ok = False
+            cleanup_note = ""
+            try:
+                _drop_database(server_url, target_name)
+                cleanup_ok = True
+            except DrillCleanupError as exc:
+                cleanup_note = str(exc)
+            except Exception as exc:  # noqa: BLE001 — unexpected → same explicit treatment
+                cleanup_note = f"{type(exc).__name__}: {exc}"
+            if cleanup_ok:
+                report.cleanup_state = "dropped"
+                report.add("disposable database dropped (cleanup verified)", True)
+            else:
+                report.cleanup_state = "failed"
+                report.cleanup_detail = scrub_secrets(cleanup_note)
+                report.add(
+                    "disposable database dropped (cleanup verified)",
+                    False,
+                    report.cleanup_detail,
+                )
+                # A drill with unhandled residue never claims complete
+                # success (D14) — and if a primary failure is already
+                # propagating, chain the cleanup failure onto it so BOTH
+                # stay visible instead of masking either.
+                report.passed = False
+                active_exc = sys.exc_info()[1]
+                if active_exc is not None:
+                    raise DrillFailure(
+                        f"{type(active_exc).__name__}: {active_exc} | "
+                        f"ADDITIONALLY, cleanup of disposable database "
+                        f"{target_name!r} FAILED — {report.cleanup_detail}"
+                    ) from active_exc
+                # Otherwise the returned report carries the failed cleanup:
+                # passed=False forces the CLI to exit non-zero.
