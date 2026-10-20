@@ -119,7 +119,7 @@ jobs:
         run: python -m pytest -q --junitxml=pytest-results.xml
       - name: Upload test results
         if: always() # upload even when tests fail, for triage
-        uses: actions/upload-artifact@v4 # TODO: pin to commit SHA after first verified run
+        uses: actions/upload-artifact@v7 # TODO: pin to commit SHA after first verified run
         with:
           name: pytest-results
           path: pytest-results.xml
@@ -155,7 +155,7 @@ jobs:
         run: python -m pytest tests/dev_checkpoint -q --junitxml=checkpoint-results.xml
       - name: Upload checkpoint tool test results
         if: always() # upload even when tests fail, for triage
-        uses: actions/upload-artifact@v4 # TODO: pin to commit SHA after first verified run
+        uses: actions/upload-artifact@v7 # TODO: pin to commit SHA after first verified run
         with:
           name: checkpoint-results
           path: checkpoint-results.xml
@@ -250,7 +250,7 @@ jobs:
         run: python -m pytest -q --junitxml=pytest-pg-results.xml
       - name: Upload PostgreSQL test results
         if: always()
-        uses: actions/upload-artifact@v4 # TODO: pin to commit SHA after first verified run
+        uses: actions/upload-artifact@v7 # TODO: pin to commit SHA after first verified run
         with:
           name: pytest-pg-results
           path: pytest-pg-results.xml
@@ -343,7 +343,7 @@ jobs:
             --junitxml=pytest-backup18-results.xml
       - name: Upload backup PG18 test results
         if: always()
-        uses: actions/upload-artifact@v4 # TODO: pin to commit SHA after first verified run
+        uses: actions/upload-artifact@v7 # TODO: pin to commit SHA after first verified run
         with:
           name: pytest-backup18-results
           path: pytest-backup18-results.xml
@@ -632,7 +632,7 @@ jobs:
           fi
       - name: Upload the audit report (always, even with findings)
         if: always()
-        uses: actions/upload-artifact@v4 # TODO: pin to commit SHA after first verified run
+        uses: actions/upload-artifact@v7 # TODO: pin to commit SHA after first verified run
         with:
           name: pip-audit-report
           path: pip-audit-report.json
