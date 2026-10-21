@@ -70,10 +70,17 @@ def verify_age_file(path) -> None:
         raise AgeFormatError(f"cannot stat encrypted artifact: {exc}") from exc
     if size == 0:
         raise AgeFormatError("encrypted artifact is empty (0 bytes)")
+    # D21-02 remediation: the bounded read below delimits the HEADER parsing
+    # window only (magic line through the ``--- <mac>`` separator line). It is
+    # NOT a limit on the artifact: legitimate backups are multi-megabyte
+    # encrypted payloads behind a header of a few hundred bytes. The
+    # pre-remediation code rejected any read longer than the window before
+    # parsing anything, which fail-closed every real-world (>1 MiB) backup.
+    # The total file size remains irrelevant here; the header must simply END
+    # inside the window (enforced at the separator below), so parsing stays
+    # bounded at MAX_HEADER_BYTES + 1 bytes read and O(window) scanning.
     with open(path, "rb") as fh:
         header_blob = fh.read(MAX_HEADER_BYTES + 1)
-    if len(header_blob) > MAX_HEADER_BYTES:
-        raise AgeFormatError("no age header separator found within the first MiB")
 
     lines = header_blob.split(b"\n")
     if not lines or lines[0] != MAGIC:
@@ -87,10 +94,17 @@ def verify_age_file(path) -> None:
     while i < len(lines):
         line = lines[i]
         if line.startswith(b"--- "):
-            saw_separator = True
             if not _is_base64_line(line[4:]):
                 raise AgeFormatError("header MAC line is not base64")
             separator_end = sum(len(part) + 1 for part in lines[: i + 1])
+            if separator_end > MAX_HEADER_BYTES:
+                # The separator line does not END within the bounded header
+                # window: either the header exceeds the bound or the MAC line
+                # is truncated by the bounded read (the lopsided +1 read
+                # makes the truncated case compute to exactly
+                # MAX_HEADER_BYTES + 2). Fail closed without reading on.
+                raise AgeFormatError("no age header separator found within the first MiB")
+            saw_separator = True
             break
         if not line.startswith(b"-> "):
             raise AgeFormatError(f"unparseable header line {i}: {line[:40]!r}")

@@ -612,6 +612,137 @@ def test_age_format_rejects_truncated_after_header(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Unit tests — D21-02 boundary regression (Stage 2.2 remediation)
+#
+# Pre-remediation, verify_age_file read MAX_HEADER_BYTES + 1 bytes and
+# rejected the artifact whenever the READ came back longer than the window —
+# before parsing a single line. Every real-world backup (a multi-megabyte
+# encrypted payload behind a header of a few hundred bytes) therefore failed
+# closed at structural verification. The remediation parses the header inside
+# the bounded window and only rejects when the header (magic line through
+# the ``--- <mac>`` separator line) cannot END inside that window; the total
+# artifact size is irrelevant to layer-1 structural validation.
+# ---------------------------------------------------------------------------
+_D21_WINDOW = 1 << 20  # mirrors age_format.MAX_HEADER_BYTES (1 MiB)
+
+
+def _sized_age_artifact(tmp_path, name: str, total_size: int) -> Path:
+    """Well-formed synthetic age artifact of exactly total_size bytes:
+    the standard header plus enough opaque payload to reach the target size."""
+    header = (
+        b"age-encryption.org/v1\n"
+        b"-> X25519 AjJhZm9yZA\n"
+        b"abcdefghijklmnopqrstuvwxyz123456\n"
+        b"--- MACLINEBASE64DATA==\n"
+    )
+    payload_len = total_size - len(header)
+    assert payload_len > 0, "artifact size must exceed the header length"
+    path = tmp_path / name
+    path.write_bytes(header + b"\x01" * payload_len)
+    assert path.stat().st_size == total_size
+    return path
+
+
+def test_d21_02_01_small_valid_artifact_still_accepted(tmp_path):
+    """D21-02-01: existing valid small artifacts remain accepted."""
+    verify_age_file(_sized_age_artifact(tmp_path, "small.age", 256))
+
+
+def test_d21_02_02_artifact_exactly_one_mib_accepted(tmp_path):
+    """D21-02-02: a valid artifact of exactly 1,048,576 bytes is accepted."""
+    verify_age_file(_sized_age_artifact(tmp_path, "exact1mib.age", _D21_WINDOW))
+
+
+def test_d21_02_03_artifact_one_byte_over_one_mib_accepted(tmp_path):
+    """D21-02-03 (the reported defect boundary): a valid artifact of
+    1,048,577 bytes must be accepted post-remediation."""
+    verify_age_file(_sized_age_artifact(tmp_path, "over1mib.age", _D21_WINDOW + 1))
+
+
+def test_d21_02_04_multimegabyte_artifact_accepted(tmp_path):
+    """D21-02-04: a valid multi-megabyte encrypted artifact is accepted."""
+    verify_age_file(_sized_age_artifact(tmp_path, "multi.age", 4 * _D21_WINDOW))
+
+
+def test_d21_02_05_large_artifact_with_invalid_magic_rejected(tmp_path):
+    """D21-02-05 (magic): artifact size must not weaken the magic check."""
+    path = _age_like_file(tmp_path, "bigbadmagic.age", b"NOT-AGE\n" + b"\x00" * (2 * _D21_WINDOW))
+    with pytest.raises(AgeFormatError, match="magic"):
+        verify_age_file(path)
+
+
+def test_d21_02_05_large_artifact_with_invalid_stanza_rejected(tmp_path):
+    """D21-02-05 (stanza): a >1 MiB artifact with an unparseable recipient
+    stanza inside the window is still rejected."""
+    path = _age_like_file(
+        tmp_path,
+        "bigbadstanza.age",
+        b"age-encryption.org/v1\n-> NOTAKNOWNSTANZA x\n" + b"\x00" * (2 * _D21_WINDOW),
+    )
+    with pytest.raises(AgeFormatError):
+        verify_age_file(path)
+
+
+def test_d21_02_05_large_artifact_with_invalid_separator_rejected(tmp_path):
+    """D21-02-05 (separator): a >1 MiB artifact whose separator MAC line is
+    not base64 is still rejected."""
+    path = _age_like_file(
+        tmp_path,
+        "bigbadmac.age",
+        b"age-encryption.org/v1\n-> X25519 AjJhZm9yZA\nabcdef\n"
+        b"--- MAC WITH SPACES AND SYMBOLS!\n" + b"\x01" * (2 * _D21_WINDOW),
+    )
+    with pytest.raises(AgeFormatError, match="base64"):
+        verify_age_file(path)
+
+
+def test_d21_02_06_header_without_separator_inside_window_rejected(tmp_path):
+    """D21-02-06: a valid-looking header whose stanza body line alone fills
+    the whole header window — no separator anywhere inside it — is rejected
+    with a bounded scan: at most the window is read and scanned even though
+    the artifact is far larger than the window."""
+    import time
+
+    header = b"age-encryption.org/v1\n-> X25519 AjJhZm9yZA\n"
+    # One single base64 body line far longer than the window (no '\n'), so
+    # the bounded read always lands mid-line with a deterministic,
+    # well-formed stanza body prefix and never a half-cut stanza line.
+    pad = b"B" * (_D21_WINDOW + 4096)
+    path = _age_like_file(tmp_path, "nosep.age", header + pad + b"\x01" * (63 * _D21_WINDOW))
+    t0 = time.monotonic()
+    with pytest.raises(AgeFormatError, match="separator"):
+        verify_age_file(path)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 2.0, f"bounded-window scan took {elapsed:.2f}s on a 64 MiB artifact"
+
+
+def test_d21_02_07_valid_header_alone_is_not_a_decryptability_claim(tmp_path):
+    """D21-02-07: structural verification stays distinct from cryptographic
+    integrity verification. A valid header with NO payload bytes is
+    rejected; a structurally valid header alone can never be represented as
+    proof that the backup is decryptable or restorable (layer 3 owns that)."""
+    bare_header = (
+        b"age-encryption.org/v1\n"
+        b"-> X25519 AjJhZm9yZA\n"
+        b"abcdefghijklmnopqrstuvwxyz123456\n"
+        b"--- MACLINEBASE64DATA==\n"
+    )
+    with pytest.raises(AgeFormatError, match="payload"):
+        verify_age_file(_age_like_file(tmp_path, "bareheader.age", bare_header))
+    # Layer separation is also asserted the other way: a truncated tail after
+    # a short payload keeps failing the structural payload check (pre-existing
+    # behavior preserved by the remediation).
+    with pytest.raises(AgeFormatError, match="payload"):
+        verify_age_file(
+            _age_like_file(
+                tmp_path,
+                "trunc2.age",
+                b"age-encryption.org/v1\n-> X25519 AAAA\nBBBB\n--- MAC==\n",
+            )
+        )
+
+
+# ---------------------------------------------------------------------------
 # Unit tests — Git hygiene (correction 6)
 # ---------------------------------------------------------------------------
 def test_gitignore_covers_backup_artifacts():
@@ -1507,3 +1638,119 @@ class TestBackupRolePrivileges:
                     conn.execute(text(f'DROP ROLE IF EXISTS "{role}"'))
             finally:
                 engine2.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Integration — D21-02-08: the real >1 MiB pipeline (Stage 2.2 remediation)
+#
+# Pre-remediation, a synthetic full pipeline whose compressed custom-format
+# backup encrypted to more than 1 MiB failed with ArtifactVerificationFailed
+# at the structural verification stage (fail-closed, nothing published).
+# Post-remediation the same pipeline must complete, publish consistently, and
+# stay fully recoverable. The dataset deliberately uses high-entropy content:
+# every entry is an AES-256-GCM ciphertext envelope produced by the real
+# EnvelopeCipher, so the custom-format dump cannot compress below the
+# 1 MiB window (no low-entropy filler).
+# ---------------------------------------------------------------------------
+def _inject_incompressible_entries(database_url: str, master_keys: str) -> int:
+    """Append ~4 MiB of high-entropy (encrypted-envelope) memory entries.
+
+    Returns the number of entries injected so the caller can fold them into
+    the expected facts (the restore drill verifies they all round-trip).
+    """
+    from sqlalchemy import create_engine, select
+    from sqlalchemy.orm import Session
+
+    from commons_core.database.models import Agent, MemoryNamespace
+    from commons_core.memory.service import write_entry as memory_write_entry
+    from tests.operational.backup_synth import MAX_BYTES, build_cipher
+
+    cipher = build_cipher(master_keys, "k1")
+    engine = create_engine(database_url)
+    injected = 0
+    try:
+        with Session(engine) as session:
+            admin = session.execute(
+                select(Agent).where(Agent.handle == "backup-synth-admin")
+            ).scalar_one()
+            ns = session.execute(
+                select(MemoryNamespace).where(MemoryNamespace.handle == "backup-synth-namespace")
+            ).scalar_one()
+            for i in range(64):
+                memory_write_entry(
+                    session,
+                    admin,
+                    ns,
+                    key=f"d2102-bulk-{i:03d}",
+                    payload=secrets.token_hex(MAX_BYTES // 2),
+                    content_type="text/plain",
+                    cipher=cipher,
+                    max_bytes=MAX_BYTES,
+                )
+                injected += 1
+            session.commit()
+    finally:
+        engine.dispose()
+    return injected
+
+
+class TestD2102FullPipelineMultiMegabyte:
+    @integration
+    def test_backup_of_multimegabyte_dataset_roundtrips(self, tmp_path):
+        source_url, master_keys, facts = build_synthetic_source(prefix="aic_d2102")
+        storage_root = tmp_path / "storage"
+        storage = LocalFilesystemStorage(storage_root)
+        identity, recipient = make_identity(tmp_path)
+        try:
+            injected = _inject_incompressible_entries(source_url, master_keys)
+            # The injected bulk entries are part of the expected facts: the
+            # drill must find every one of them restored (68 rows, not 4).
+            facts["table_counts"]["memory_entries"] = (
+                facts["table_counts"].get("memory_entries", 0) + injected
+            )
+            outcome = run_backup(
+                database_url=source_url,
+                recipient=recipient,
+                storage=storage,
+                work_dir=tmp_path / "work",
+            )
+            backup_id = outcome.manifest.backup_id
+
+            # Publication state is consistent (no fail-closed rejection).
+            assert storage.has_commit_marker(backup_id)
+
+            # The stored artifact exceeds the 1 MiB header window.
+            stored = storage_root / "data" / f"{backup_id}.age"
+            assert stored.is_file()
+            assert stored.stat().st_size > (1 << 20), (
+                f"artifact is only {stored.stat().st_size} bytes; "
+                "the dataset did not exercise the >1 MiB boundary"
+            )
+
+            # Stored artifact hash matches the manifest.
+            from commons_core.backup.manifest import sha256_file
+
+            assert sha256_file(stored) == outcome.artifact_sha256
+            assert sha256_file(stored) == outcome.manifest.artifact["sha256"]
+
+            # Storage protections: no stray temporaries, .age-only data dir.
+            assert list((tmp_path / "work").rglob("*.part")) == []
+            data_files = list((storage_root / "data").iterdir())
+            assert data_files and all(f.suffix == ".age" for f in data_files)
+
+            # Full cryptographic + restore verification with the synthetic
+            # recovery identity (layer 3) — decryptability IS proven here,
+            # never by the structural layer alone.
+            report = run_restore_drill(
+                server_url=ADMIN_URL,
+                storage=storage,
+                backup_id=backup_id,
+                identity_path=identity,
+                toolbelt=make_toolbelt(),
+                expected_facts=facts,
+                master_keys=master_keys,
+            )
+            assert report.passed, report.render()
+            assert len(report.checks) >= 10
+        finally:
+            admin_drop_db(source_url.rsplit("/", 1)[-1])
