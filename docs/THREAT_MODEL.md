@@ -22,8 +22,9 @@ preventive controls, detection/containment controls, relevant automated
 tests, and residual risk.
 
 The Phase 1 system being modeled is the code at `src/commons_core/`
-(version 0.1.0) as verified by the automated suite (342 passed, 2 skipped —
-see `docs/TESTING.md`). Simulated agents are deterministic test fixtures;
+(version 0.1.0) as verified by the automated suite (Phase 1 record, 2026-10-17:
+342 passed, 2 skipped; current baseline 617 passed / 42 skipped — see
+`docs/TESTING.md`). Simulated agents are deterministic test fixtures;
 **no real AI model is connected**, and no claim about model behavior is made
 here.
 
@@ -132,7 +133,9 @@ malicious (spec §24). We evaluate boundaries, not intent.
 
 One table per threat. Status meanings: **Implemented** = code + automated
 tests; **Partial** = code exists, verification incomplete; **Deferred** =
-future phase. Test names refer to the current suite (342 passed / 2 skipped).
+future phase. Test names refer to the suite as of the Phase 1 baseline
+(342 passed / 2 skipped); the suite has since grown — see `docs/TESTING.md` §2
+for the current baseline.
 
 ### T-01 — Identity spoofing
 

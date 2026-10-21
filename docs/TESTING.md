@@ -5,12 +5,14 @@ How to run the suite, what it proves, and — honestly — what it does not.
 ## 1. How to run
 
 ```bash
-cd /home/z/commons-core
+cd /path/to/commons-core          # your local clone
 
 # 1) environment (first time)
 python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"        # runtime pins + httpx/pytest/ruff dev extras
+pip install -e ".[dev,postgres]"  # dev extras + pinned psycopg; the postgres
+                              # extra is required for the full suite
+                              # (CI installs the same; see ci.yml)
 
 # 2) full deterministic suite (no network, injected clocks, ~35 s)
 .venv/bin/python -m pytest -q
@@ -29,7 +31,10 @@ Notes: the `dev` extra is defined in `pyproject.toml`
 `.env` — `tests/conftest.py` builds isolated settings with disposable dev
 keys. Local server smoke (optional): `.venv/bin/python -m commons_core`.
 
-## 2. Current results (executed for this document, sandbox environment)
+## 2. Results — Phase 1 record and current baseline
+
+**Phase 1 record** (executed for this document, sandbox environment,
+2026-10-17; preserved as a dated historical record):
 
 | Command | Result |
 |---|---|
@@ -43,9 +48,22 @@ keys. Local server smoke (optional): `.venv/bin/python -m commons_core`.
 combinations that are out of the transition matrix *by construction*
 (parametrized cases that assert the matrix has no such edge).
 
+**Current baseline** (repository hygiene audit, 2026-10-20, commit `491ac5c`,
+SQLite backend, Python 3.12.15, age v1.3.2): **617 passed, 42 skipped,
+0 failed** (≈67 s; the same single known deprecation warning). The 42 skips
+are PostgreSQL-gated suites self-skipping by design (see §6); `ruff check`
+and `ruff format --check` are clean. GitHub CI was green at the same commit
+with all eight jobs, including the PostgreSQL 16 job (migration round-trip,
+schema verification, full suite) and the PostgreSQL 18.6 backup/recovery
+job — those PostgreSQL results are GitHub-reported CI, not local audit
+executions.
+
 ## 3. Test inventory (what each file proves)
 
-Suite = 344 collected (342 passed + 2 skipped). Categories map to spec §29.
+Suite at the Phase 1 baseline (2026-10-17) = 344 collected (342 passed + 2
+skipped); the suite has since grown — 617 passed / 42 skipped at the
+2026-10-20 audit baseline (see §2). The inventory below is the Phase 1 record;
+categories map to spec §29.
 
 | File | Tests | Category (spec §29) | What it proves |
 |---|---|---|---|
@@ -85,21 +103,22 @@ Suite = 344 collected (342 passed + 2 skipped). Categories map to spec §29.
   the suite is disposable fixture text (sentinel markers deliberately do
   NOT match anything real).
 
-## 5. Untested / untestable in this environment (honest)
+## 5. Untested / untestable areas — Phase 1 record, updated with current status (honest)
 
 | Area | Status | Why |
 |---|---|---|
-| Docker build & compose run | **Not executed** | Docker unavailable in the sandbox; `Dockerfile`/`compose.yaml` are prepared, unverified artifacts (validated for YAML syntax only). |
-| GitHub Actions CI | **Not executed** | Workflows prepared (`.github/workflows/ci.yml`); GitHub Actions never ran in this sandbox; results unknown until first push. |
-| PostgreSQL-only behaviors | **Not executed** | All tests run on SQLite. Migration 0001 verified on SQLite only; PostgreSQL locking upgrades (e.g. `SELECT … FOR UPDATE`) are code comments, not verified behavior. |
+| Docker build & compose run | **Executed in CI since publication** | *(Historical, Phase 1: Docker unavailable in the sandbox.)* The `docker` CI job builds the image and runs the compose stack (non-root check, fail-closed startup, authenticated smoke, clean teardown) on every push/PR — green at the 2026-10-20 audit baseline. |
+| GitHub Actions CI | **Executed since publication** | *(Historical, Phase 1: workflows were prepared but had not yet run when this table was written.)* `ci.yml` documents successful runs since publication; all eight jobs were green at the 2026-10-20 audit baseline (`491ac5c`). |
+| PostgreSQL-only behaviors | **Executed since the Phase 1 hardening pass** | *(Historical, Phase 1: all tests ran on SQLite only.)* §6 records the PostgreSQL integration run (full suite, alembic round-trip, `FOR UPDATE SKIP LOCKED` proven); CI replicates it on every push. |
 | TLS / production transport | **Not executed** | No deployment; localhost dev is plain HTTP. |
-| Railway deployment | **Not executed** | Explicitly forbidden without authorization (spec §31); no Railway resources were created or modified. |
-| `pg_dump` backup + restore | **Not executed** | Recovery tests cover application-level persistence, not full DB backup/restore (documented gap; procedure in `docs/DEPLOYMENT.md`). |
+| Railway deployment | **Not executed** *(historical Phase 1 record; current status not established)* | *(Historical, Phase 1: deployment was explicitly forbidden without authorization (spec §31) and no Railway resources were created or modified in the Phase 1 sandbox.)* Per the maintainer-provided milestone record (`docs/milestones/2026-10-19-phase-1.md` §4–§5; see also `docs/RAILWAY.md`, status "DEPLOYED 2026-10-19"), a Railway deployment has since occurred — three services reported Online, `/health` returned HTTP 200, and the `noop`/`heartbeat` smoke tasks passed (2026-10-18). Deployment activity is not equivalent to deployment testing: no systematic Railway-specific validation or disaster-recovery testing is established by the available records, and production backup-and-restore remains unverified. The current status of Railway deployment testing has **not been established by the available evidence**. |
+| `pg_dump` backup + restore | **Implemented and tested since Stage 1 (ADR-0009)** | *(Historical, Phase 1: a documented gap.)* `docs/BACKUP.md` documents the streaming `pg_dump → age` pipeline, atomic publication, and the synthetic restore drill; CI runs the backup/recovery suites against real PostgreSQL 16 and 18.6. A real-data production drill remains future, separately authorized work. |
 | Real model resistance to prompt injection | **Not applicable in Phase 1** | No LLM connected; injection tests verify infrastructure enforcement only (spec §13) — NOT universal model resistance. |
-| `AIC_TASK_TIMEOUT_SECONDS` enforcement | **Not implemented** | Setting exists but is inert (no code enforces it); effective bounds are the worker lease + retry caps. Recorded in the worklog. |
+| `AIC_TASK_TIMEOUT_SECONDS` enforcement | **Implemented and tested since the Phase 1 hardening pass** | Enforced via `execute_claimed(timeout_seconds)` + the revocable session guard, with lease/timeout coherence at worker startup (see SC-34 in `docs/SECURITY_CONTROLS.md`); covered by `tests/operational/test_task_timeout.py` (10 tests). *(Historical: inert at Phase 1.)* |
 
-**No fabricated coverage numbers or guarantees:** every number above comes
-from the run in §2 executed in this environment.
+**No fabricated coverage numbers or guarantees:** every number above traces to
+a dated, cited record — the §2 runs, the referenced CI configuration and its
+recorded outcomes, or the named test files.
 
 ## 6. PostgreSQL integration (Phase 1 hardening — EXECUTED)
 
@@ -159,8 +178,8 @@ New/changed test files (this hardening pass):
 
 - The `docker` and `postgres` CI jobs in `.github/workflows/ci.yml` were
   authored for GitHub Actions. The `postgres` job replicates locally what
-  was executed above; the `docker` job (image build, non-root check,
-  compose stack, smoke test) could NOT be executed in this environment —
-  no Docker runtime exists in the sandbox. It will execute on GitHub
-  Actions after the branch is pushed; its first real results will appear
-  on the pull request.
+  was executed above. *(Historical, hardening pass: the `docker` job could
+  not be executed in that environment — no Docker runtime in the sandbox;
+  first execution was expected on GitHub Actions after push.)* Since
+  publication both jobs have executed on GitHub on every push and pull
+  request; all eight jobs were green at the 2026-10-20 audit baseline.
