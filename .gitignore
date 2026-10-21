@@ -234,3 +234,15 @@ age-identity*.txt
 *.recovery-metadata.json
 *.recovery-secrets.age
 age-identity-custody-*.txt
+
+# AIC local runtime artifacts (repository-hygiene review 2026-10-21, PR-2).
+# Covers the default dev SQLite directory (/data/, see .env.example and
+# docs/DEPLOYMENT.md §1), local key files, and virtual-environment name
+# variants such as .venv-audit or .venv-310 at the repository root.
+# Anchored to the root so nested test fixtures or documentation examples
+# named data/ or .venv* are NOT ignored.
+# These rules are a hygiene backstop only: they do not replace secret
+# scanning or proper credential handling.
+/data/
+*.key
+/.venv*
