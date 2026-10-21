@@ -606,6 +606,15 @@ def cancel_task(
     may be mid-execution; a terminal task already finished). Non-owners get
     a 403 authorization error (task ids are unguessable UUIDs — the same
     existence-oracle trade-off as messages, documented).
+
+    The state guard is ENFORCED BY THE DATABASE, not only by the possibly
+    stale ORM object: the pending→cancelled transition is a single
+    conditional ``UPDATE ... WHERE status='pending'`` (the same pattern as
+    :func:`claim_next`). If a concurrent transaction already claimed,
+    executed or finished the task after this (possibly stale) read, the
+    UPDATE affects zero rows and the canceller receives the documented 409
+    — a cached ``pending`` status can no longer overwrite a task another
+    transaction moved (D21-01 / R02-A).
     """
     if task.agent_id != owner.id:
         # Defensive re-check; routes record the authz_denial event first.
@@ -614,7 +623,29 @@ def cancel_task(
         raise InvalidStateError(
             f"Only pending tasks can be cancelled (current status={task.status!s})."
         )
-    task.status = TaskStatus.CANCELLED
-    task.finished_at = as_utc(now or utc_now())
-    session.flush()
+    finished_at = as_utc(now or utc_now())
+    result = session.execute(
+        update(ScheduledTask)
+        .where(
+            ScheduledTask.id == task.id,
+            ScheduledTask.status == TaskStatus.PENDING,
+        )
+        .values(
+            status=TaskStatus.CANCELLED,
+            finished_at=finished_at,
+            updated_at=finished_at,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        # A concurrent transaction moved the task out of pending between our
+        # read and this UPDATE (READ COMMITTED recheck evaluates the WHERE
+        # predicate against the committed row version). Re-read the
+        # authoritative status for the error message and fail closed —
+        # never report a cancellation that did not happen.
+        session.expire(task)
+        raise InvalidStateError(
+            f"Only pending tasks can be cancelled (current status={task.status!s})."
+        )
+    session.expire(task)  # re-load the authoritative cancelled state on access
     return task
