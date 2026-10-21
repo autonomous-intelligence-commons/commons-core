@@ -1,11 +1,16 @@
 # Deployment — AIC Phase 1 (Railway preparation & local Docker)
 
-> **No deployment was performed.** No Railway resources were created,
-> configured, or modified; no Docker image was built or run; no paid service
-> was activated; no real AI model API was called. Docker and Railway were
-> **not available in the Phase 1 sandbox** — everything in this document is
-> *preparation*: files and instructions for a future, separately authorized
-> deployment. All deployment actions require explicit user authorization
+> **No deployment was performed** *(Phase 1 writing-time record, 2026-10-17
+> — before the recorded deployment; see the §2 status note)*. No Railway
+> resources were created, configured, or modified; no Docker image was
+> built or run; no paid service was activated; no real AI model API was
+> called. Docker and Railway were **not available in the Phase 1 sandbox**
+> — everything in this document was written as *preparation*: files and
+> instructions for what was then a future, separately authorized
+> deployment. Per the maintainer-provided milestone record, that
+> deployment has since occurred (see the §2 status note and
+> `docs/RAILWAY.md`); no production-readiness verification is claimed
+> here. All deployment actions require explicit user authorization
 > after Phase 1.
 
 ## 1. Required environment variables
@@ -15,27 +20,43 @@ disposable dev values only).
 
 | Variable | Required | Dev default | Production guidance |
 |---|---|---|---|
-| `AIC_DATABASE_URL` | yes | `sqlite+pysqlite:///./data/commons.db` | `postgresql+psycopg://user:pass@host:5432/commons` — use the Railway PostgreSQL private-network URL. Bare platform schemes (`postgresql://` / `postgres://`, e.g. Railway's `${{Postgres.DATABASE_URL}}` reference) are normalized automatically at Settings load; percent-encoded userinfo is supported (see docs/RAILWAY.md). Install `psycopg[binary]` alongside the pinned deps when adding the PostgreSQL driver (it is NOT in the Phase 1 pinned set because SQLite was the sandbox DB). |
-| `AIC_MASTER_KEYS` | yes (prod) | `k1:<64 hex zeros>` (disposable!) | `kid:<hex>` pairs, comma-separated. Generate each key with `python -c "import secrets; print(secrets.token_hex(32))"`. **Never commit.** Empty value → ephemeral in-memory key (dev only; data lost on restart, loud warning). |
+| `AIC_DATABASE_URL` | yes | `sqlite+pysqlite:///./data/commons.db` | `postgresql+psycopg://user:pass@host:5432/commons` — use the Railway PostgreSQL private-network URL. Bare platform schemes (`postgresql://` / `postgres://`, e.g. Railway's `${{Postgres.DATABASE_URL}}` reference) are normalized automatically at Settings load; percent-encoded userinfo is supported (see docs/RAILWAY.md). Install the PostgreSQL driver via the pinned `postgres` dependency extra (`psycopg[binary]==3.2.13` in `pyproject.toml`, matching the production image pin): `pip install -e ".[postgres]"`. |
+| `AIC_MASTER_KEYS` | yes (prod) | unset → ephemeral in-memory key (all-zero and other placeholder keys are rejected at startup) | `kid:<hex>` pairs, comma-separated. Generate each key with `python -c "import secrets; print(secrets.token_hex(32))"`. **Never commit.** Empty value → ephemeral in-memory key (dev only; data lost on restart, loud warning). |
 | `AIC_ACTIVE_KEY_ID` | yes (prod) | `k1` | The `kid` that seals new envelopes. Must exist in `AIC_MASTER_KEYS` (startup fails otherwise). |
 | `AIC_API_HOST` / `AIC_API_PORT` | no | `127.0.0.1` / `8010` | On Railway use `0.0.0.0` and `$PORT` (Railway injects `PORT`; do NOT hardcode). |
-| `AIC_ENV` | no | `development` | Set `production` for clarity in telemetry (`env` field). |
+| `AIC_ENV` | no | `development` | `production` is **fail-closed at startup**: it requires a PostgreSQL database URL and valid master keys (see §11). Also shown in telemetry (`env` field). |
 | `AIC_RATE_LIMIT_PER_MINUTE` | no | 120 | Per-agent request limit. |
 | `AIC_MAX_MESSAGES_PER_MINUTE` | no | 60 | Durable per-agent message quota. |
 | `AIC_MAX_MESSAGE_BYTES` | no | 65536 | Message size cap (413). |
 | `AIC_MAX_MEMORY_ENTRY_BYTES` | no | 65536 | Memory entry size cap (413). |
 | `AIC_MAX_PENDING_TASKS` | no | 1000 | Global in-queue task cap (429). |
 | `AIC_MAX_TASK_ATTEMPTS` | no | 3 | Retry cap per task. |
-| `AIC_TASK_TIMEOUT_SECONDS` | no | 30 | **Honest note:** this setting is currently *inert* — it is defined in `config/settings.py` but not enforced anywhere in Phase 1 (the effective bound is the worker lease, `--lease-seconds`, default 30, plus retry caps). Kept as a documented configuration placeholder; enforcement is deferred (recorded in the Phase 1 worklog). |
+| `AIC_TASK_TIMEOUT_SECONDS` | no | 30 | **Enforced** as the worker execution budget: claimed tasks run under `execute_claimed(timeout_seconds)` with a revocable session guard, and the worker refuses to start unless `lease_seconds > task_timeout_seconds` (compose default `--lease-seconds 90`; see §11). Regression-tested in `tests/operational/test_task_timeout.py` (10 tests). *(Historical note: inert at Phase 1 — enforcement was added by the Phase 1 hardening pass.)* |
 | `AIC_RETENTION_SECURITY_EVENTS_DAYS` | no | 14 | Retention policy for security events (pruning job deferred — see `docs/SECURITY_CONTROLS.md` SC-26). |
 | `AIC_LOG_LEVEL` | no | `INFO` | Keep INFO in prod (log lines are content-free by design). |
 
 **Secret rules:** master keys, database credentials and admin tokens live in
 the platform's variable store (Railway Variables) or the local `.env`
 (git-ignored) — never in the repository, never in image layers, never in
-logs. `.gitignore` already excludes `.env`, `data/`, `*.key`.
+logs. At the time of writing, `.gitignore` excludes `.env` but **not**
+`data/`, `*.key`, or `.venv*` variants; a separate ignore-hygiene patch
+(PR-2) has been proposed to add those patterns and is **not yet
+implemented**. Until it lands, keep such files out of the repository
+manually — ignore rules are a backstop, not a substitute for secret hygiene.
 
-## 2. Railway service layout (planned — nothing created)
+## 2. Railway service layout (planned — historical Phase 1 record)
+
+> **Status note (2026-10-21):** This section was written during Phase 1
+> preparation, when the layout was *planned* and nothing had been created
+> (no Docker or Railway access existed in the Phase 1 sandbox). Railway
+> services have since been created: per the maintainer-provided milestone
+> record (`docs/milestones/2026-10-19-phase-1.md` §4; see also
+> `docs/RAILWAY.md`, status "DEPLOYED 2026-10-19"), `commons-core`,
+> `Postgres`, and `commons-worker` were all reported Online. That
+> deployment record does not establish production backup custody,
+> off-provider backup retention, full disaster-recovery testing, or
+> unattended autonomous Agent operations. The topology and security
+> warnings below remain the documented reference.
 
 Project (already existing per spec §1): `autonomous-intelligence-commons`.
 
@@ -170,12 +191,15 @@ Release with `DELETE` on the same path. Full procedure:
 `scripts/manage.py provision --handle ops-admin --admin` run against the
 production database (one-time token display).
 
-## 9. Local Docker development (files prepared — NOT executed here)
+## 9. Local Docker development (verified by the CI docker job)
 
-`Dockerfile` and `compose.yaml` are included in the repository. **They were
-never built or run in this sandbox (Docker unavailable)** — treat them as
-prepared, unverified artifacts; validate on a Docker-capable machine before
-relying on them.
+`Dockerfile` and `compose.yaml` are included in the repository. *(Historical,
+Phase 1: they were never built or run in the development sandbox — Docker was
+unavailable there.)* Since publication, the `docker` CI job has built the image
+and run the compose stack on every push and pull request (non-root user check,
+fail-closed startup check, authenticated smoke test, clean teardown) — green
+at the 2026-10-20 hygiene-audit baseline. The commands below remain the
+manual reference flow for a Docker-capable machine.
 
 Services in `compose.yaml`:
 
@@ -254,13 +278,22 @@ undecryptable). Rotation requires a restart; history is not re-encrypted.
 
 Environment variables required: `AIC_DATABASE_URL` (Railway PostgreSQL),
 `AIC_MASTER_KEYS`, `AIC_ACTIVE_KEY_ID`, `AIC_ENV=production`. Compatible
-with Railway env vars or sealed secrets; no external paid KMS. **No
-Railway deployment has been performed.** Private-network reachability is
-NOT an authorization boundary (spec §18). Run `alembic upgrade head`
+with Railway env vars or sealed secrets; no external paid KMS.
+*(Historical, Phase 1 writing-time record (2026-10-17): "No Railway
+deployment has been performed." was accurate when written; it no longer
+describes the present state.)* Per the maintainer-provided milestone
+record, a Railway deployment has since occurred (see the §2 status note
+and `docs/RAILWAY.md`); that record does not establish production
+disaster recovery, independent backup custody, off-provider backups,
+or unattended autonomous Agent operation. Private-network reachability
+is NOT an authorization boundary (spec §18). Run `alembic upgrade head`
 (migrate step) before starting api/worker; see §7 of this document and
 compose.yaml for the service topology.
 
-The complete deployment-ready Railway configuration (service layout,
+The complete Railway deployment configuration (service layout,
 reference-variable syntax, pre-deploy migration strategy, backup/key
 custody, cost plan, and step-by-step web-UI instructions) lives in
-**docs/RAILWAY.md** — prepared for review, NOT deployed.
+**docs/RAILWAY.md** — a Phase 1 runbook that, per its own status header
+and the maintainer-provided milestone record, was prepared, reviewed,
+and then executed (deployed 2026-10-19); it is not a
+production-readiness certification.

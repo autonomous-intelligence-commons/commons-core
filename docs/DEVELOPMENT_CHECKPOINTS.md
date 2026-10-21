@@ -390,7 +390,7 @@ production secrets and never deploys.
 
 ```bash
 # Create (clean tree, versioned name, refuses overwrite/dirt/secrets):
-python scripts/dev_checkpoint.py --output-dir /home/z/checkpoints \
+python scripts/dev_checkpoint.py --output-dir /path/to/checkpoints \
     --worklog /path/to/worklog.md \
     --milestone-done "implementation" --milestone-pending "integration tests" \
     --test "python -m pytest -q" --test-result "488 passed" \

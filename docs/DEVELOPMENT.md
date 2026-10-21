@@ -6,8 +6,11 @@ is authoritative and separate from this operational guide.
 ## Environment
 
 - Python >= 3.12 (venv at `.venv/`)
-- Local database: SQLite (`./data/commons.db`); PostgreSQL-ready via SQLAlchemy
-  — honest limitation: **only SQLite is exercised in this sandbox**.
+- Local database: SQLite (`./data/commons.db`); PostgreSQL-ready via SQLAlchemy.
+  *(Historical, Phase 1 (2026-10-17): only SQLite was exercised in the development
+  sandbox.)* CI now verifies PostgreSQL on every push: the `postgres` job runs
+  the migration round-trip and the full suite against PostgreSQL 16, and
+  `backup-postgres18` runs the backup/recovery suites against PostgreSQL 18.6.
 - Configuration: `AIC_*` environment variables (see `.env.example`).
   With `AIC_MASTER_KEYS` empty, an ephemeral in-memory key is generated with
   a loud warning (data encrypted with it is lost on restart).
@@ -15,10 +18,12 @@ is authoritative and separate from this operational guide.
 ## First-time setup
 
 ```bash
-cd /home/z/commons-core
+cd /path/to/commons-core          # your local clone
 source .venv/bin/activate
-pip install -e ".[dev]"        # or use the pinned venv as-is
-cp .env.example .env           # optional; defaults are safe for local dev
+pip install -e ".[dev,postgres]"  # the postgres extra (pinned psycopg) is
+                                   # required for the full suite — CI installs
+                                   # the same; see .github/workflows/ci.yml
+cp .env.example .env              # optional; defaults are safe for local dev
 ```
 
 ## Database migrations (canonical schema path)
@@ -72,8 +77,9 @@ Requests use `Authorization: Bearer <token>`.
 ## Tests, lint, format
 
 ```bash
-cd /home/z/commons-core
-.venv/bin/python -m pytest -q          # full suite (deterministic, no network)
+cd /path/to/commons-core          # your local clone
+.venv/bin/python -m pytest -q          # full suite (deterministic, no network;
+                                       #  requires the .[dev,postgres] install)
 .venv/bin/ruff check .                 # lint (E,F,W,I,UP,B; line length 100)
 .venv/bin/ruff format .                # format everything
 ```
@@ -167,7 +173,8 @@ communication plus `UNKNOWN_NAMESPACE`/`UNKNOWN_ENTRY` (404) and
 - **Telemetry:** `GET /api/v1/admin/telemetry` (admin only) — counters and
   infrastructure state only (`collect_telemetry`); never message/memory
   content, agent handles, channel or namespace handles. Emergency-stop
-  endpoints are NOT here — they belong to the scheduler domain (Agent C);
+  endpoints are NOT here — they are admin endpoints implemented in the admin
+  router (`commons_core.api.routes.admin`, `POST/DELETE /api/v1/admin/emergency-stop`);
   telemetry only *reads* the `system_state` row `emergency_stop`.
 - Quota check happens BEFORE payload processing, so 413/422-rejected sends
   do not consume quota.

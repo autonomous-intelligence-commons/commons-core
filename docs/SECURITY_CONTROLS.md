@@ -6,7 +6,9 @@ threat model (`docs/THREAT_MODEL.md`, T-01…T-15).
 **Status vocabulary (honest):**
 
 - **Implemented and tested** — code exists; automated tests in this
-  repository exercise it (suite result: 342 passed, 2 skipped).
+  repository exercise it (suite result at the 2026-10-20 audit baseline:
+  617 passed, 42 skipped on SQLite; Phase 1 record when this register was
+  written: 342 passed, 2 skipped).
 - **Implemented, partially verified** — code exists; some verification done,
   but a stated gap remains (e.g. environment not exercised).
 - **Designed, not implemented** — design exists in code/docs only.
@@ -48,7 +50,7 @@ alignments at the end are reference mappings, not certifications.
 | SC-27 | Logging policy (categories + principals, never content) | Privacy | T-04 | `infrastructure/logging.py` + code-wide convention; `api/app.py` error handlers | Format carries level/logger/message; 500 handler logs class + path + request id; validation errors stripped of input echo | `test_sentinel_absent_from_logs`, `TestNoPlaintextAtRest::test_authorized_reader_still_sees_plaintext` | Implemented and tested | Enforcement is by convention + tests, not a log filter — a future careless log line needs review/tests to catch |
 | SC-28 | Governance structural boundary + privilege-language lint (visibility, NOT boundary) | Autonomy/security separation | T-03, T-09 | `governance/service.py` (lint, `PRIVILEGE_TERMS`, versioning), `server_policy.py` (boundary) | Lint → 422 `GOVERNANCE_PRIVILEGE_CLAIM` + `policy_violation` event; engine never reads governance records | `tests/security/test_governance_boundary.py` (11 tests incl. lint-bypass structural proof) | Implemented and tested (lint explicitly NOT a boundary) | Lint trivially bypassed (documented); boundary is the canary-tested engine isolation |
 | SC-29 | Deterministic simulated task handlers only (no code execution, no model APIs, no network tools) | Execution isolation | T-09, T-13 | `scheduler/registry.py` (whitelist: `noop`, `heartbeat`, `activity_reminder`), task payload policy | Unknown kind → 422; forbidden payload keys; no shell/eval/fetch primitives anywhere | `tests/unit/test_scheduler_unit.py` (36 tests); OpenAPI surface assertions | Implemented and tested | Future real-model execution requires a separate sandbox + threat review (spec §17) |
-| SC-30 | Supply-chain hygiene (pinned deps; CI/audit prepared) | Integrity of the build | T-12 | `pyproject.toml` (exact pins, 7 runtime deps); `.github/workflows/ci.yml` (prepared), `.github/dependabot.yml` (prepared), `Dockerfile`/`compose.yaml` (prepared) | Pins in metadata; CI lint/test/migrate-check + non-blocking pip-audit job (least-privilege `permissions: contents: read`) | **Not executable in this sandbox** — files exist, YAML parses; CI has never run | Implemented (pinning) / **Prepared, unverified** (CI, Dependabot, Docker) | No lock file; no image scanning; no action-SHA guarantee beyond documented intent |
+| SC-30 | Supply-chain hygiene (pinned deps; CI/audit prepared) | Integrity of the build | T-12 | `pyproject.toml` (exact pins, 7 runtime deps); `.github/workflows/ci.yml` (prepared), `.github/dependabot.yml` (prepared), `Dockerfile`/`compose.yaml` (prepared) | Pins in metadata; CI lint/test/migrate-check + non-blocking pip-audit job (least-privilege `permissions: contents: read`) | *(Historical, Phase 1: not executable in that sandbox; CI had not yet run.)* CI has run successfully on GitHub since publication — all eight jobs (including Docker build and both PostgreSQL suites) were green at the 2026-10-20 audit baseline | Implemented (pinning); CI and Docker executed on GitHub Actions (green at the 2026-10-20 audit baseline); Dependabot prepared (activation is GitHub-side, not tracked in this register) | No lock file; no image scanning; no action-SHA guarantee beyond documented intent |
 | SC-31 | Recovery: persistence across restart, lease expiry, graceful shutdown | Resilience | T-15 (partial), T-06 | `scheduler/worker.py` (SIGTERM handling, stop event), tests | New engine on same file processes surviving tasks; in-flight task completes before exit | `tests/recovery/test_scheduler_recovery.py` (9 tests: `test_tasks_survive_engine_teardown_and_process_afterwards`, `test_sequential_workers_execute_each_task_exactly_once`, `TestGracefulShutdown`) | Implemented and tested | Full DB backup/restore (pg_dump) NOT tested — documented procedure only |
 | SC-32 | Encryption-key rotation procedure (documented) | Key compromise response | T-15 | `docs/DEPLOYMENT.md` + `KeyStore` multi-kid design | Add new kid → set active kid → restart; old envelopes still open | `test_multi_key_rotation_old_envelopes_still_open` | Implemented (design) / partially verified (single-process test only) | No re-encryption tool; no automated rotation; losing a kid = losing its historical data |
 
@@ -91,7 +93,7 @@ verification pending an environment that does not exist here) /
 | SC-34 | Worker execution-timeout enforcement + abandoned-handler session guard | Availability; task-state integrity | T-06-style resource exhaustion via long-running handlers | `scheduler/service.py` (`execute_claimed(timeout_seconds)`, `_ExecutionGuard` revocable session proxy), `worker.py` (lease > timeout coherence) | `tests/operational/test_task_timeout.py` (10 tests incl. zombie-guard and concurrency) | **Implemented and tested** | No hard kill of non-session C calls — bounded by lease expiry + restart (documented) |
 | SC-35 | PostgreSQL-backed integration verification (migrations + full suite + scheduler concurrency with FOR UPDATE SKIP LOCKED) | Integrity of the production datastore path | SQLite-vs-PostgreSQL behavioral divergence | `tests/conftest.py` fail-loud backend selection; PG dialect locking in `claim_next`; backend-aware recovery tests | 382 passed / 2 skipped on PostgreSQL 16.2; alembic round-trip + schema inspection; live production E2E | **Implemented and tested** | CI replication of the PG job executes on GitHub Actions (same commands) |
 | SC-36 | Lease/timeout coherence enforcement | Task-state consistency under concurrency | Double-claim while a stuck handler lingers | `run_worker` refuses `lease_seconds <= task_timeout_seconds`; compose worker `--lease-seconds 90` vs default timeout 30 | `test_worker_refuses_lease_not_exceeding_timeout` | **Implemented and tested** | None known within stated semantics |
-| SC-37 | Docker image & compose verification in CI | Build integrity; runtime posture (non-root, secret injection, startup order) | T-12 supply chain / build drift | `.github/workflows/ci.yml` `docker` job (build, uid=1001 check, fail-closed startup check, compose stack + authenticated smoke + worker task + teardown) | Authored; NOT executable in the development sandbox (no Docker) | **Partially verified** (pending first GitHub Actions run after push) | First execution happens on the PR; any compose/port surprises surface there |
+| SC-37 | Docker image & compose verification in CI | Build integrity; runtime posture (non-root, secret injection, startup order) | T-12 supply chain / build drift | `.github/workflows/ci.yml` `docker` job (build, uid=1001 check, fail-closed startup check, compose stack + authenticated smoke + worker task + teardown) | *(Historical: not executable in the Phase-1 development sandbox — no Docker runtime.)* Executed on GitHub Actions on every push/PR; green at the 2026-10-20 audit baseline | **Implemented and tested** (executed in CI) | Runs on GitHub-hosted runners; production-host-specific behavior remains untested |
 
 Register updates to existing controls:
 
@@ -100,9 +102,10 @@ Register updates to existing controls:
   third-party Actions in the docker job); pip-audit remains non-blocking
   but findings are VISIBLE (job log + JSON artifact + warning annotation)
   and must be triaged per this document. Status of CI execution: the
-  original four jobs have run on GitHub since publication; the two new
-  jobs execute on the first push of this branch → **Partially verified**
-  until then.
+  original four jobs have run on GitHub since publication, and the jobs
+  added later have executed on subsequent pushes as well — all eight jobs
+  (including `docker` and both PostgreSQL suites) were green at the
+  2026-10-20 hygiene-audit baseline (`491ac5c`).
 - **SC-32 (key rotation):** upgraded from "Implemented (design) /
   partially verified" — rotation behavior is now covered by dedicated
   automated tests (retained-kid decryptability, removal → typed

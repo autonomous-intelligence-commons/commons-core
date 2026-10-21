@@ -155,7 +155,10 @@ This is the stated, accepted threat model boundary.
 ## 3. Test evidence
 
 All claims below map to the current suite (`tests/unit/test_crypto.py`, 26
-tests; plus privacy suites). Suite result: **342 passed, 2 skipped**.
+tests; plus privacy suites). Suite result at the Phase 1 baseline
+(2026-10-17): **342 passed, 2 skipped**; the suite has since grown —
+**617 passed / 42 skipped** at the 2026-10-20 audit baseline (see
+`docs/TESTING.md` §2).
 
 | File / node | What it proves |
 |---|---|

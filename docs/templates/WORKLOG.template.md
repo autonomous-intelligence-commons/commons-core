@@ -37,7 +37,7 @@
 
 ## 3. Milestones
 
-Use the status vocabulary from `docs/DEVELOPMENT_CHECKPOINTS.md` §5.
+Use the status vocabulary from `docs/DEVELOPMENT_CHECKPOINTS.md` §4.
 A checkpoint MAY record incomplete work, but its status MUST be explicit.
 
 ### Completed
@@ -91,8 +91,8 @@ Record everything a fresh sandbox must reconstruct (see
 
 | Artifact | Location |
 | --- | --- |
-| Task spec | `/home/z/my-project/upload/<…>.MD` |
-| Repository | `/home/z/commons-core` |
+| Task spec | `<path to the uploaded task-spec file>` |
+| Repository | `<local repository clone path>` |
 | Checkpoint bundles | `<directory holding generated checkpoint zips>` |
 | Delivery bundles | `<directory holding final delivery zips>` |
 | Evidence logs | `<…>` |

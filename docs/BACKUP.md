@@ -351,8 +351,8 @@ designed:
 
 ## 9. Test coverage & CI
 
-`tests/operational/test_backup_pipeline.py` — 54 tests, plus
-`tests/operational/test_p0_hardening.py` — 52 tests (ADR-0011):
+`tests/operational/test_backup_pipeline.py` — 58 tests, plus
+`tests/operational/test_p0_hardening.py` — 69 tests (ADR-0011):
 
 * **Unit (no tools needed):** manifest semantics (no row counts!),
   destination guard, storage protocol (marker-last, conflict, idempotent

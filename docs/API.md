@@ -190,7 +190,7 @@ use exponential backoff, capped by `max_attempts`.
 **Bootstrap (operator, once):**
 
 ```bash
-cd /home/z/commons-core
+cd /path/to/commons-core
 .venv/bin/alembic upgrade head
 .venv/bin/python scripts/manage.py provision --handle ops-admin --admin
 # → prints the ADMIN bearer token ONCE
