@@ -439,6 +439,18 @@ class ScheduledTask(Base):
     attempts: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=0)
     max_attempts: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=3)
     lease_expires_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    #: Monotonic lease fencing generation (R02-B1, migration 0002). Increments
+    #: ONLY inside ``claim_next``'s conditional UPDATE (DB-side) — every
+    #: successful claim starts a new ownership epoch; lease expiration and
+    #: recovery (``expire_leases``) never touch it. Worker-owned state
+    #: transitions must present the generation held at claim time; a
+    #: superseded generation is rejected by the database (CAS rowcount gate).
+    #: ``0`` is the initial value for rows never claimed by fencing-aware
+    #: code (migration default) — there is NO authorized execution path at
+    #: generation 0 (INV-9): the first claim raises a pending row to 1.
+    lease_generation: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, default=0, server_default=sa.text("0")
+    )
     last_error: Mapped[str | None] = mapped_column(sa.String(200))
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True), nullable=False, default=utc_now

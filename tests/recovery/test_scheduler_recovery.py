@@ -169,7 +169,11 @@ class TestLeaseExpiry:
             reclaimed = service.claim_next(session, later, 30)
             assert reclaimed is not None
             assert reclaimed.attempts == 2
-            service.execute_claimed(session, reclaimed, later)
+            # R02-B1 worker pattern: the generation is read from the claim
+            # INSIDE the transaction (post-claim expired object re-reads
+            # the DB-side incremented value) and carried to the execute call.
+            held_generation = int(reclaimed.lease_generation)
+            service.execute_claimed(session, reclaimed, later, lease_generation=held_generation)
         with file_database.session() as session:
             task = service.get_task(session, task_id)
             assert task.status == TaskStatus.SUCCEEDED

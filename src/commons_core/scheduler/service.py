@@ -36,6 +36,19 @@ Durable task queue semantics — HONEST guarantees:
   by ``run_worker``): ``lease_seconds`` must EXCEED ``timeout_seconds`` so a
   timed-out-but-stuck handler cannot outlive its lease and get claimed by a
   second worker while still holding the guard.
+- **Lease fencing (R02-B1, Phase-1 database-state fencing).** Every claim
+  atomically increments ``scheduled_tasks.lease_generation`` (DB-side,
+  inside the claim's conditional UPDATE). Worker-owned transitions
+  (execution-start / success / failure / retry) are conditional UPDATEs that
+  must present the generation held at claim time — a superseded lease
+  context is rejected BY THE DATABASE (rowcount gate →
+  :class:`LeaseSupersededError`, zero bytes written; the stale handler is
+  never invoked). Lease recovery (``expire_leases``) is a system-owned
+  transition authorized by authoritative database state only (status +
+  expiry + attempt accounting) and never touches the generation. Fencing is
+  freshness, NOT identity: a matching current generation does not
+  establish worker identity (threat-model actor 3, design review §2.5) —
+  external-effect gates (R02-B2) must not trust caller-asserted generations.
 - **Idempotency.** ``idempotency_key`` is globally unique: re-submitting
   the same key RETURNS the existing task (no duplicate) when the owner
   matches; a different owner using the same key gets 409
@@ -177,6 +190,85 @@ class TaskExecutionRevokedError(Exception):
     an abandoned handler thread so it can never commit or corrupt task state
     after the timeout failure has been applied.
     """
+
+
+class LeaseSupersededError(DomainError):
+    """A stale lease context was rejected by the database fencing gate (409).
+
+    R02-B1 (Phase-1 database-state fencing): raised when a worker-owned
+    state transition (execution-start / success / failure / retry) presents
+    a claim ``lease_generation`` that no longer matches the row's current
+    generation, or when the execution-start row is no longer ``leased`` —
+    in every case the conditional UPDATE matched zero rows, so NOTHING was
+    written (zero bytes of a superseded worker's state reach the database).
+
+    Worker-internal by design (never surfaced by API routes — only the
+    worker loop and tests call the fenced transitions); ``status_code``
+    exists only because :class:`DomainError` requires an HTTP mapping if the
+    type ever leaks. PRIVACY RULE (extends ``last_error`` policy): the
+    message carries ONLY the task id, the held generation and the
+    authoritative status/generation counts — never payload content.
+    """
+
+    status_code = 409
+    code = "LEASE_SUPERSEDED"
+
+    def __init__(
+        self,
+        task_id: str,
+        held_generation: int,
+        current_status: object,
+        current_generation: int,
+    ) -> None:
+        super().__init__(
+            "Task lease was superseded before this write; the transition was "
+            "rejected and nothing was written (stale worker context).",
+            task_id=str(task_id),
+            held_generation=int(held_generation),
+            current_status=str(current_status),
+            current_generation=int(current_generation),
+        )
+
+
+class FencingSchemaError(RuntimeError):
+    """The fencing column is missing — fencing-aware code refuses to run (OG-1).
+
+    Raised by :func:`verify_fencing_schema` when ``scheduled_tasks`` lacks
+    ``lease_generation`` (database at migration 0001 while a fencing-aware
+    worker/binary is starting). Fail-closed: refusing to start is SAFER than
+    running unfenced (the original R02-B vulnerability).
+    """
+
+
+def verify_fencing_schema(session: Session) -> None:
+    """Fail-closed startup gate: ``scheduled_tasks.lease_generation`` must exist.
+
+    A fencing-aware worker MUST NOT operate against a schema that lacks the
+    fencing column: every worker-owned transition depends on the DB-side CAS
+    predicate, and an unfenced run reopens the original R02-B vulnerability
+    (stale workers writing task state unconditionally). Called once at worker
+    startup (see ``run_worker``); also usable by deployment gates (OG-1/DG-1).
+
+    Raises :class:`FencingSchemaError` when the column is missing.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    bind = session.get_bind()
+    if bind is None:  # pragma: no cover - defensive
+        raise FencingSchemaError("no database bind available for the fencing schema check")
+    inspector = sa_inspect(bind)
+    if not inspector.has_table(ScheduledTask.__tablename__):
+        raise FencingSchemaError(
+            "scheduled_tasks table not found — run migrations before starting fencing-aware workers"
+        )
+    columns = {c["name"] for c in inspector.get_columns(ScheduledTask.__tablename__)}
+    if "lease_generation" not in columns:
+        raise FencingSchemaError(
+            "scheduled_tasks.lease_generation is missing — the database is at "
+            "migration 0001 while this build requires 0002 (lease fencing). "
+            "Run `alembic upgrade head` BEFORE starting workers; refusing to "
+            "run unfenced (fail-closed, OG-1/DG-1)."
+        )
 
 
 class PayloadNestingTooDeepError(DomainError):
@@ -473,6 +565,19 @@ def claim_next(
     is already claiming instead of blocking on its row lock (short
     transactions keep lock hold times minimal). Claiming increments
     ``attempts`` (it counts as an attempt) and sets ``lease_expires_at``.
+
+    R02-B1 lease fencing: the same conditional UPDATE ALSO increments
+    ``lease_generation`` on the database side
+    (``lease_generation = lease_generation + 1`` — never a Python-side
+    read-modify-write). Exactly one generation increment happens per
+    SUCCESSFUL claim; losing claims increment nothing. The winning generation
+    is readable from the returned object's ``lease_generation`` attribute —
+    the caller MUST read it INSIDE this transaction (the returned object is
+    expired, so the attribute re-reads the authoritative incremented value),
+    and MUST carry that value to every subsequent worker-owned transition
+    (see :func:`execute_claimed`). ``lease_generation`` is the claim
+    ownership epoch: ``0`` means "never claimed by fencing-aware code";
+    there is no authorized execution path at generation 0 (INV-9).
     """
     now = as_utc(now)
     if lease_seconds < 1:
@@ -496,12 +601,17 @@ def claim_next(
                 status=TaskStatus.LEASED,
                 lease_expires_at=lease_until,
                 attempts=ScheduledTask.attempts + 1,
+                lease_generation=ScheduledTask.lease_generation + 1,
                 updated_at=now,
             )
             .execution_options(synchronize_session=False)
         )
         if result.rowcount == 1:
             session.expire(candidate)
+            # NOTE: the winning generation is intentionally NOT materialized
+            # here — the caller reads ``candidate.lease_generation`` inside
+            # this transaction (the expired object re-selects the
+            # authoritative incremented value).
             return candidate
     return None
 
@@ -511,27 +621,70 @@ def execute_claimed(
     task: ScheduledTask,
     now: datetime,
     timeout_seconds: float = 0.0,
+    *,
+    lease_generation: int,
 ) -> ScheduledTask:
     """Execute a leased task through its registered handler (spec §16).
 
-    Marks the task ``running`` (informational, intra-transaction), dispatches
-    to the registry handler — with a wall-clock execution budget of
-    ``timeout_seconds`` when > 0 (guarded worker thread; see
-    :func:`_run_handler_on_thread`) — then: success → ``succeeded``
-    (+``finished_at``); failure (including timeout) → ``failed`` (terminal)
-    when ``attempts >= max_attempts``, else back to ``pending`` with
-    ``run_at = now + backoff(attempts)``. On failure the transaction is
-    rolled back FIRST to discard any partial handler writes, then the
-    failure state is applied — an abandoned (timed-out) handler thread can
-    never apply state afterwards because its session access is revoked.
+    R02-B1 database-state fencing — EVERY worker-owned transition below is a
+    conditional UPDATE whose predicate is evaluated by the DATABASE (the
+    ``lease_generation`` keyword-only argument is REQUIRED and has no
+    default: an internal caller cannot forget to carry fencing and end up
+    half-fenced):
+
+    1. Execution-start gate (leased→running): ``WHERE id=:id AND
+       status='leased' AND lease_generation=:held`` — a superseded worker
+       (its claim was recovered and re-claimed, raising the row's generation)
+       fails here and the handler is NEVER invoked; nothing is written and
+       :class:`LeaseSupersededError` is raised (fail-closed).
+    2. Success / failure / retry completion: ``WHERE id=:id AND
+       lease_generation=:held`` — the same-transaction running marker set by
+       (1) keeps the row locked, so within one transaction this guards the
+       failure path's post-rollback window (the handler failure first rolls
+       the transaction back — releasing the row lock — and the recovery
+       state is then applied under the generation predicate; a re-claim that
+       happened in that window makes the CAS miss and raises
+       :class:`LeaseSupersededError`, never an ordinary failure write).
+
+    The handler runs with a wall-clock budget of ``timeout_seconds`` when
+    > 0 (guarded worker thread; see :func:`_run_handler_on_thread`). On
+    failure the transaction is rolled back FIRST to discard any partial
+    handler writes, then the failure state is applied via the CAS UPDATE.
     ``last_error`` stores the exception class + message, truncated to 200
-    chars — never payload data.
+    chars — never payload data. A :class:`LeaseSupersededError` is NEVER
+    converted into an ordinary task failure (an authorization loss is not a
+    business failure) and never pollutes ``last_error``/``finished_at``.
+
+    The Python-side ``status != LEASED`` pre-check (below) is kept as a
+    fail-fast first layer — same double-layer pattern as ``cancel_task``:
+    a quick Python rejection in front of the authoritative database gate.
     """
     now = as_utc(now)
     if task.status != TaskStatus.LEASED:
         raise InvalidStateError(f"Only leased tasks can be executed (status={task.status!s}).")
-    task.status = TaskStatus.RUNNING
-    session.flush()
+
+    # --- T2: execution-start gate (worker-owned CAS) ---------------------
+    start_result = session.execute(
+        update(ScheduledTask)
+        .where(
+            ScheduledTask.id == task.id,
+            ScheduledTask.status == TaskStatus.LEASED,
+            ScheduledTask.lease_generation == lease_generation,
+        )
+        .values(status=TaskStatus.RUNNING, updated_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    if start_result.rowcount != 1:
+        # Fail-closed: zero bytes written; the handler is never invoked.
+        session.expire(task)
+        raise LeaseSupersededError(task.id, lease_generation, task.status, task.lease_generation)
+    # Authoritative reload (NOT a bare ORM re-write): the object the caller
+    # holds now reflects the running marker AND stays readable after this
+    # session commits and closes (callers legitimately read the returned
+    # object's attributes afterwards — the baseline contract). refresh()
+    # does not dirty the object, so no later flush could emit an
+    # unconditional ORM write that bypasses the CAS.
+    session.refresh(task)
 
     handler = registry.get_handler(task.kind)
     if handler is None:
@@ -544,54 +697,137 @@ def execute_claimed(
     if failure is not None:
         # Discard partial handler writes before applying the failure state.
         session.rollback()
-        session.expire(task)  # re-read authoritative claim state after rollback
-        task.status = TaskStatus.LEASED  # restored intra-transaction marker
+        # Authoritative re-read AFTER the rollback (the handler may have
+        # modified the object; the rollback discarded those changes): refresh
+        # re-selects the committed claim state the CAS below will verify.
+        session.refresh(task)
 
     if failure is None:
-        task.status = TaskStatus.SUCCEEDED
-        task.finished_at = now
-        task.lease_expires_at = None
+        # --- T3: success transition (worker-owned CAS) -------------------
+        # No status predicate: the same-transaction running marker set by
+        # the start gate keeps the row locked until commit, so within this
+        # transaction the generation alone identifies the claim holder.
+        result = session.execute(
+            update(ScheduledTask)
+            .where(
+                ScheduledTask.id == task.id,
+                ScheduledTask.lease_generation == lease_generation,
+            )
+            .values(
+                status=TaskStatus.SUCCEEDED,
+                finished_at=now,
+                lease_expires_at=None,
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            session.rollback()
+            session.expire(task)
+            raise LeaseSupersededError(
+                task.id, lease_generation, task.status, task.lease_generation
+            )
     else:
+        # --- T4/T5: failure / retry transition (worker-owned CAS) ---------
+        # ``attempts``/``max_attempts`` are re-read from the authoritative
+        # row AFTER the rollback (the handler may have modified the object).
         error_text = f"{type(failure).__name__}: {failure}"[:_LAST_ERROR_MAX_CHARS]
-        task.last_error = error_text
-        task.lease_expires_at = None
-        if task.attempts >= task.max_attempts:
-            task.status = TaskStatus.FAILED
-            task.finished_at = now
+        attempts_now = int(task.attempts)
+        if attempts_now >= int(task.max_attempts):
+            fail_values = {
+                "status": TaskStatus.FAILED,
+                "finished_at": now,
+                "last_error": error_text,
+                "lease_expires_at": None,
+                "updated_at": now,
+            }
         else:
-            task.status = TaskStatus.PENDING
-            task.run_at = now + timedelta(seconds=backoff_delay(task.attempts))
-    session.flush()
+            fail_values = {
+                "status": TaskStatus.PENDING,
+                "run_at": now + timedelta(seconds=backoff_delay(attempts_now)),
+                "last_error": error_text,
+                "lease_expires_at": None,
+                "updated_at": now,
+            }
+        result = session.execute(
+            update(ScheduledTask)
+            .where(
+                ScheduledTask.id == task.id,
+                ScheduledTask.lease_generation == lease_generation,
+            )
+            .values(**fail_values)
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            # A re-claim superseded this lease during the post-rollback
+            # window — an authorization loss, never an ordinary failure.
+            session.rollback()
+            session.expire(task)
+            raise LeaseSupersededError(
+                task.id, lease_generation, task.status, task.lease_generation
+            )
+    # Authoritative final reload: the returned object carries the committed
+    # transition values (readable after session close — baseline contract),
+    # and refresh() does NOT dirty the object (no unconditional ORM re-write
+    # could ever bypass the CAS on a later flush).
+    session.refresh(task)
     return task
 
 
 def expire_leases(session: Session, now: datetime) -> int:
     """Recover expired leases; returns the number of recovered tasks.
 
-    A leased task whose ``lease_expires_at < now`` returns to ``pending``
-    WITHOUT a new attempt (the attempt was counted at claim). A task whose
-    attempts are exhausted fails as lease-expired (terminal, static error
-    message — no payload data).
+    R02-B1 (W2 closure, system-owned transitions — Phase 0 P0-1): recovery
+    is performed by TWO single-statement conditional bulk UPDATEs whose
+    predicates are evaluated by the DATABASE at write time:
+
+    - attempts exhausted (``attempts >= max_attempts``): ``leased → failed``
+      (terminal, static error message — no payload data) + ``finished_at``;
+    - attempts remaining: ``leased → pending`` (re-claimable at-least-once).
+
+    There is NO SELECT→write two-phase window left to exploit: a task that
+    a concurrent transaction completed (``succeeded``), cancelled or
+    re-claimed between recovery passes simply does not match the
+    ``status='leased'`` predicate and is NOT counted and NOT overwritten —
+    a committed terminal state can never be flipped back by the reaper.
+    The reaper does not hold (or need) any worker's claim generation:
+    lease recovery is a system-owned transition authorized by authoritative
+    database state alone (current status + expiry timestamp + attempt
+    accounting); it NEVER touches ``lease_generation`` (monotonicity:
+    generation increments only at claim — INV-2). The returned count is
+    the number of rows the UPDATEs actually recovered.
     """
     now = as_utc(now)
-    expired = list(
-        session.scalars(
-            select(ScheduledTask).where(
-                ScheduledTask.status == TaskStatus.LEASED,
-                ScheduledTask.lease_expires_at < now,
-            )
-        )
+    expired_where = (
+        ScheduledTask.status == TaskStatus.LEASED,
+        ScheduledTask.lease_expires_at < now,
     )
-    for task in expired:
-        task.lease_expires_at = None
-        if task.attempts >= task.max_attempts:
-            task.status = TaskStatus.FAILED
-            task.finished_at = now
-            task.last_error = "lease expired after the final attempt"
-        else:
-            task.status = TaskStatus.PENDING
-    session.flush()
-    return len(expired)
+    # Exhausted attempts → terminal lease-expired failure.
+    exhausted = session.execute(
+        update(ScheduledTask)
+        .where(*expired_where, ScheduledTask.attempts >= ScheduledTask.max_attempts)
+        .values(
+            status=TaskStatus.FAILED,
+            finished_at=now,
+            lease_expires_at=None,
+            last_error="lease expired after the final attempt",
+            updated_at=now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    # Attempts remaining → pending (re-claimable; the attempt was already
+    # counted at claim time — recovery adds NO new attempt).
+    remaining = session.execute(
+        update(ScheduledTask)
+        .where(*expired_where, ScheduledTask.attempts < ScheduledTask.max_attempts)
+        .values(
+            status=TaskStatus.PENDING,
+            lease_expires_at=None,
+            updated_at=now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return int(exhausted.rowcount) + int(remaining.rowcount)
 
 
 def cancel_task(

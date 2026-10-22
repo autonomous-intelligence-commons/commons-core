@@ -104,12 +104,21 @@ postgres (healthy)
 
 - Migration runs against `AIC_DATABASE_URL` (env.py resolves it — nothing is
   hardcoded in `alembic.ini`).
-- Verified locally on SQLite (upgrade/downgrade/upgrade round-trip); **not
-  verified against PostgreSQL in this sandbox** — the first real deployment
-  should run `alembic upgrade head` manually and check the result before
-  starting the worker.
+- Verified locally on SQLite and disposable PostgreSQL (upgrade/downgrade/
+  upgrade round-trip, migration `0002` lease fencing included).
 - Worker startup after migrations is required (it reads `scheduled_tasks` /
   `system_state`).
+- **Lease fencing (migration `0002`, R02-B1)**: the worker verifies at
+  startup that `scheduled_tasks.lease_generation` exists and REFUSES to
+  start otherwise (fail-closed — a fencing-aware binary must not run
+  unfenced against a `0001`-schema database). Deploy order for the `0002`
+  rollout is therefore unchanged — `migrate` completes before `worker`
+  starts — but a mixed-version window (old worker binary running against
+  an upgraded schema, or new binary against an un-upgraded schema) is
+  unsupported: stop and drain the old workers, then start the new ones
+  (blue-green swap). Tasks left `pending` while workers are stopped are the
+  safe state — zero writes, zero data damage; expired leases are recovered
+  automatically once a fencing-aware worker starts.
 
 ## 4. Logging restrictions
 
@@ -122,6 +131,15 @@ drain access per platform best practice. `AIC_LOG_LEVEL=INFO` recommended.
 
 1. Application rollback: `git revert <commit>` (or redeploy previous
    revision in Railway) and restart `commons-api` + `commons-worker`.
+   **Worker rollback doctrine (R02-B1 lease fencing)**: reverting to an
+   UNFENCED legacy worker binary re-opens the original R02-B vulnerability
+   (stale workers writing task state unconditionally) and is **NOT a
+   safety-preserving rollback**. A safe worker rollback either rolls
+   FORWARD to another fencing-aware build, or SUSPENDS worker execution
+   entirely (tasks stay `pending` — no data damage) until a reviewed
+   recovery procedure exists. Schema downgrade (`0002` → `0001`) by itself
+   is not an operational rollback either: the defect lives in code, not in
+   the schema.
 2. Schema rollback: **caution** — `alembic downgrade` on a database with
    live data is destructive (e.g. `downgrade base` drops tables). Prefer
    forward-fix migrations; if a downgrade is unavoidable, snapshot the
