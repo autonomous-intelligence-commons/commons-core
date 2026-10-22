@@ -33,7 +33,7 @@ from commons_core.infrastructure.system_state import (
     EMERGENCY_STOP_KEY,
     write_system_state,
 )
-from commons_core.infrastructure.time import utc_now
+from commons_core.infrastructure.time import as_utc, utc_now
 from commons_core.scheduler import registry, service
 from commons_core.scheduler.worker import run_worker
 
@@ -64,6 +64,9 @@ def _claim(database, task_id: str, *, advance: float = 0.0):
 
     ``advance`` moves the claim's clock forward (past retry backoff),
     mirroring how the real worker simply waits and re-claims later.
+    Returns ``(task_id, lease_generation)`` — the winning generation is
+    captured INSIDE the claim transaction (R02-B1 worker Phase-1 pattern)
+    and carried to the phase-2 execute.
     """
     with database.session() as session:
         claimed = service.claim_next(
@@ -71,15 +74,22 @@ def _claim(database, task_id: str, *, advance: float = 0.0):
         )
         assert claimed is not None
         assert claimed.id == task_id
-        return task_id
+        generation = int(claimed.lease_generation)  # read pre-commit (fresh post-claim read)
+    return task_id, generation
 
 
-def _execute(database, task_id: str, timeout_seconds: float):
-    """Execute in its own transaction (the real worker's phase 2)."""
+def _execute(database, task_id: str, timeout_seconds: float, *, lease_generation: int):
+    """Execute in its own transaction (the real worker's phase 2).
+
+    ``lease_generation`` is the generation captured at claim time — the
+    same contract as ``run_worker``'s Phase-1 → Phase-2 carry.
+    """
     with database.session() as session:
         task = service.get_task(session, task_id)
         assert task is not None
-        return service.execute_claimed(session, task, utc_now(), timeout_seconds)
+        return service.execute_claimed(
+            session, task, utc_now(), timeout_seconds, lease_generation=lease_generation
+        )
 
 
 def _status(database, task_id: str) -> TaskStatus:
@@ -99,9 +109,9 @@ class TestExecutionTimeout:
 
         registry.register("slow-ok", slow_but_ok)
         task_id = _create_task(database, agent, kind="slow-ok")
-        _claim(database, task_id)
+        task_id, generation = _claim(database, task_id)
 
-        result = _execute(database, task_id, timeout_seconds=5.0)
+        result = _execute(database, task_id, timeout_seconds=5.0, lease_generation=generation)
         assert result.status == TaskStatus.SUCCEEDED
         assert result.last_error is None
         assert events == ["ran"]
@@ -109,11 +119,11 @@ class TestExecutionTimeout:
     def test_task_exceeding_budget_returns_to_pending_with_backoff(self, database, agent) -> None:
         registry.register("sleepy", lambda session_arg, task: time.sleep(3.0))
         task_id = _create_task(database, agent, kind="sleepy")
-        _claim(database, task_id)
+        task_id, generation = _claim(database, task_id)
 
         started = time.monotonic()
         before = utc_now()
-        result = _execute(database, task_id, timeout_seconds=0.2)
+        result = _execute(database, task_id, timeout_seconds=0.2, lease_generation=generation)
         elapsed = time.monotonic() - started
         assert elapsed < 2.0  # control returned at the timeout, not after the sleep
 
@@ -122,7 +132,10 @@ class TestExecutionTimeout:
         assert result.last_error is not None
         assert result.last_error.startswith("TaskTimeoutError")
         assert result.run_at is not None
-        assert result.run_at >= before  # now + backoff(attempts=1) is in the future
+        # as_utc: SQLite re-loads datetimes tz-naive (execute_claimed now
+        # authoritative-reloads the returned object; R02-A session precedent —
+        # minimal mechanical adaptation, no behavior change).
+        assert as_utc(result.run_at) >= before  # now + backoff(attempts=1) is in the future
 
     def test_exhausted_retries_after_timeouts_end_failed(self, database, agent) -> None:
         registry.register("always-slow", lambda session_arg, task: time.sleep(3.0))
@@ -130,8 +143,8 @@ class TestExecutionTimeout:
 
         statuses = []
         for _ in range(3):  # max_attempts = 3 (advance past each backoff)
-            _claim(database, task_id, advance=70)
-            result = _execute(database, task_id, timeout_seconds=0.15)
+            task_id, generation = _claim(database, task_id, advance=70)
+            result = _execute(database, task_id, timeout_seconds=0.15, lease_generation=generation)
             statuses.append(result.status)
         assert statuses == [TaskStatus.PENDING, TaskStatus.PENDING, TaskStatus.FAILED]
 
@@ -156,9 +169,9 @@ class TestExecutionTimeout:
 
         registry.register("zombie", zombie)
         task_id = _create_task(database, agent, kind="zombie")
-        _claim(database, task_id)
+        task_id, generation = _claim(database, task_id)
 
-        result = _execute(database, task_id, timeout_seconds=0.1)
+        result = _execute(database, task_id, timeout_seconds=0.1, lease_generation=generation)
         assert result.status == TaskStatus.PENDING  # timeout failure applied
         assert result.last_error is not None
         assert result.last_error.startswith("TaskTimeoutError")
@@ -175,8 +188,8 @@ class TestExecutionTimeout:
         marker = "TOPSECRET-PAYLOAD-MARKER"
         registry.register("sleepy", lambda session_arg, task: time.sleep(3.0))
         task_id = _create_task(database, agent, kind="sleepy", payload={"note": marker})
-        _claim(database, task_id)
-        result = _execute(database, task_id, timeout_seconds=0.15)
+        task_id, generation = _claim(database, task_id)
+        result = _execute(database, task_id, timeout_seconds=0.15, lease_generation=generation)
         assert marker not in (result.last_error or "")
 
     def test_zero_timeout_keeps_legacy_inline_execution(self, database, agent) -> None:
@@ -187,8 +200,8 @@ class TestExecutionTimeout:
 
         registry.register("direct", direct)
         task_id = _create_task(database, agent, kind="direct")
-        _claim(database, task_id)
-        result = _execute(database, task_id, timeout_seconds=0)
+        task_id, generation = _claim(database, task_id)
+        result = _execute(database, task_id, timeout_seconds=0, lease_generation=generation)
         assert result.status == TaskStatus.SUCCEEDED
         assert seen["thread"] is True  # executed inline, no guard thread
 

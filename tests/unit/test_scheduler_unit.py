@@ -113,7 +113,10 @@ class TestClaimMechanics:
             max_task_attempts=3,
         )
         with pytest.raises(InvalidStateError):
-            service.execute_claimed(session, task, T0)
+            # lease_generation=0: the task was never claimed (INV-9 — no
+            # authorized execution path at generation 0); the fail-fast
+            # status pre-check fires before any database access.
+            service.execute_claimed(session, task, T0, lease_generation=0)
 
     def test_cancel_only_pending(self, session, session_agent) -> None:
         task, _ = service.create_task(

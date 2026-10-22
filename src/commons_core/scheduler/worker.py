@@ -13,12 +13,19 @@
 2. ``expire_leases`` — recover leases lost to crashed workers.
 3. ``claim_next`` — lease the oldest eligible pending task (committed
    before execution: a crash mid-execution lets the lease expire and the
-   task retry — AT-LEAST-ONCE execution, no exactly-once claim).
+   task retry — AT-LEAST-ONCE execution, no exactly-once claim). The claim
+   also atomically raises ``lease_generation``; the worker captures the
+   winning generation inside the Phase-1 transaction and carries it to
+   Phase 2 (R02-B1 lease fencing).
 4. ``execute_claimed`` — dispatch to the deterministic registered handler,
    bounded by ``task_timeout_seconds`` of wall-clock time when > 0 (Phase 1
    hardening: the handler runs on a guard-wrapped thread; a timeout is a
    normal failure → retry/backoff; an abandoned handler thread can never
    touch the session again — see scheduler.service for the honest limits).
+   Every worker-owned write re-validates the carried generation at the
+   database boundary (conditional UPDATE + rowcount gate); a superseded
+   lease is rejected before handler invocation, logged, not counted as an
+   executed task and never retried under another worker's generation.
 
 The scheduler OFFERS execution opportunities only: handlers are
 deterministic, message-free and never require agents to produce messages
@@ -133,6 +140,16 @@ def run_worker(
     ``lease_seconds > task_timeout_seconds`` (coherent claim/timeout
     semantics — see the module docstring).
 
+    R02-B1 lease fencing: the worker verifies at startup that the database
+    carries the ``lease_generation`` fencing column (fail-closed — a
+    fencing-aware binary refuses to run against a 0001 schema, OG-1/DG-1),
+    captures the claim generation INSIDE the Phase-1 transaction and carries
+    it into Phase 2. A superseded claim (recovered and re-claimed by another
+    worker while this one was between phases) is rejected BEFORE the handler
+    is invoked and is logged, NOT counted as an executed task and NOT
+    retried under another worker's generation (the new claim holder owns
+    the task now; a retry here would cross-lease fight it).
+
     ``idle_sleep`` — seconds slept between idle polls (default ``1.0``:
     one database poll per second while idle keeps a continuously running
     service off a high-frequency query path). The wait is interruptible
@@ -166,23 +183,40 @@ def run_worker(
 
     processed = 0
     stop_logged = False
+    fencing_gate_passed = False
     while True:
         if owned_stop_event is not None and owned_stop_event.is_set():
             break
 
         now = as_utc(clock())
         claimed_id: str | None = None
+        claim_generation: int | None = None
         paused = False
         with session_factory() as session:
             paused = emergency_stop_active(session)
             if not paused:
+                if not fencing_gate_passed:
+                    # Fail-closed startup gate (once per run): a fencing-aware
+                    # worker refuses to run against a schema without the
+                    # fencing column (OG-1/DG-1) — the error propagates and
+                    # the worker process fails to start.
+                    service.verify_fencing_schema(session)
+                    fencing_gate_passed = True
                 # Phase 1 (one transaction): recover expired leases, then
                 # atomically lease the oldest eligible task. Both effects
                 # commit with this context — a crash after this point leaves
                 # the task LEASED with a future lease expiry (recoverable).
                 service.expire_leases(session, now)
                 task = service.claim_next(session, now, lease_seconds)
-                claimed_id = task.id if task is not None else None
+                if task is not None:
+                    claimed_id = task.id
+                    # Capture the winning generation INSIDE this transaction
+                    # (the post-claim expired object re-reads the DB-side
+                    # incremented value). It must NEVER be re-read from the
+                    # database later: the worker's OWN claim epoch is carried
+                    # from here to Phase 2 (a later "current" value could
+                    # belong to somebody else's claim).
+                    claim_generation = int(task.lease_generation)
 
         if paused:
             # Spec §16/§21: no new claims, no execution while engaged.
@@ -203,12 +237,57 @@ def run_worker(
         # Phase 2 (separate transaction): execute the leased task. The stop
         # flag and emergency stop are NOT re-checked here — the task was
         # legitimately claimed and completes (graceful shutdown semantics).
+        superseded = False
         with session_factory() as session:
             task = service.get_task(session, claimed_id)
-            if task is not None and task.status == service.TaskStatus.LEASED:
-                service.execute_claimed(
-                    session, task, as_utc(clock()), timeout_seconds=task_timeout_seconds
+            if task is None or task.status != service.TaskStatus.LEASED:
+                # Fail-fast layer 1: the row is no longer leased (recovered
+                # and possibly re-claimed between the phases). Log and skip —
+                # never execute and never count.
+                superseded = True
+                _LOGGER.info(
+                    "task %s is no longer leased at execution time "
+                    "(status=%s) — discarding this claim",
+                    claimed_id,
+                    task.status if task is not None else "missing",
                 )
+            elif int(task.lease_generation) != int(claim_generation):
+                # Fail-fast layer 2 (R02-B1): the row's current generation no
+                # longer matches the generation THIS worker won at claim time
+                # — another worker holds the lease now. The authoritative
+                # fence is the CAS inside execute_claimed; this cheap stale
+                # read only avoids a pointless handler dispatch.
+                superseded = True
+                _LOGGER.info(
+                    "task %s lease superseded (held generation %s, current %s) "
+                    "— discarding stale claim without execution",
+                    claimed_id,
+                    claim_generation,
+                    task.lease_generation,
+                )
+            else:
+                try:
+                    service.execute_claimed(
+                        session,
+                        task,
+                        as_utc(clock()),
+                        timeout_seconds=task_timeout_seconds,
+                        lease_generation=claim_generation,
+                    )
+                except service.LeaseSupersededError as exc:
+                    # The database fence rejected this (now-stale) lease at
+                    # the write boundary: log it, do NOT count it as an
+                    # executed task, do NOT convert it to a task failure and
+                    # do NOT retry — the new claim holder owns the task.
+                    superseded = True
+                    _LOGGER.info("task %s: %s", claimed_id, exc.message)
+
+        if superseded:
+            # Superseded work is not a successful execution — the loop
+            # continues and the current (legitimate) holder proceeds.
+            if once:
+                break
+            continue
 
         processed += 1
         if once:
