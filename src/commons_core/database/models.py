@@ -31,6 +31,8 @@ from commons_core.database.enums import (
     AgentStatus,
     ChannelKind,
     CredentialStatus,
+    EffectRiskLevel,
+    EffectStatus,
     GovernanceKind,
     GovernanceStatus,
     SecurityEventCategory,
@@ -521,6 +523,157 @@ class QuotaCounter(Base):
     )
 
 
+class EffectRequest(Base):
+    """A durable external-effect request row (R02-B2 E1 — FAKE-ONLY).
+
+    Durable transactional outbox for SYNTHETIC fake-provider effects. Phase 0
+    corrected lifecycle (P0-C1): dispatcher claim (``CLAIMED``) and submission
+    intent (``SUBMITTED``) are distinct durable facts; ``submitted_at`` is a
+    LOCAL marker committed BEFORE the provider call — it is NOT proof of
+    provider receipt, and its absence is NOT proof of "no submission".
+
+    Fencing/ownership axes (P0-C4):
+    - ``claim_generation`` — immutable snapshot of the task's lease
+      generation at authorization time; revalidated against
+      ``scheduled_tasks.lease_generation`` at submit time (defense in depth —
+      never the dispatcher's identity).
+    - ``claim_epoch`` — monotonic dispatcher ownership counter, incremented
+      ONLY inside the claim's conditional UPDATE (mirrors the R02-B1
+      ``lease_generation`` accounting); deadline recovery NEVER touches it.
+      Every dispatcher-owned write presents the held epoch; a superseded
+      dispatcher writes zero bytes (:class:`StaleDispatcherError`).
+
+    Data minimization (P0-C2, revised INV-EF-R9): ``operation`` is a strictly
+    schema-bounded, allowlisted SYNTHETIC operation descriptor (versioned,
+    code-registered capability schema — never executed, never interpreted
+    as commands); ``request_digest`` is verified against the canonical form
+    at BOTH authorization and dispatch time. Real-effect parameters are
+    structurally impossible in E1 (no real capability exists).
+    """
+
+    __tablename__ = "effect_requests"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "task_id",
+            "capability",
+            "resource_key",
+            name="uq_effect_requests_task_capability_resource",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(sa.String(36), primary_key=True, default=new_uuid)
+    task_id: Mapped[str] = mapped_column(
+        sa.String(36),
+        sa.ForeignKey("scheduled_tasks.id", name="fk_effect_requests_task_id_scheduled_tasks"),
+        nullable=False,
+        index=True,
+    )
+    agent_id: Mapped[str] = mapped_column(
+        sa.String(36),
+        sa.ForeignKey("agents.id", name="fk_effect_requests_agent_id_agents"),
+        nullable=False,
+        index=True,
+    )
+    #: Snapshot of ``scheduled_tasks.lease_generation`` at authorization time
+    #: (immutable after write — INV-EF-R2).
+    claim_generation: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    capability: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    risk_level: Mapped[EffectRiskLevel] = mapped_column(
+        str_enum(EffectRiskLevel, name="effect_risk_level"), nullable=False
+    )
+    status: Mapped[EffectStatus] = mapped_column(
+        str_enum(EffectStatus, name="effect_status"), nullable=False, index=True
+    )
+    #: Bounded synthetic operation descriptor (P0-C2); validated at
+    #: authorization AND re-validated + digest-verified at dispatch.
+    operation: Mapped[dict] = mapped_column(sa.JSON, nullable=False)
+    request_digest: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    resource_key: Mapped[str | None] = mapped_column(sa.String(128))
+    approval_id: Mapped[str | None] = mapped_column(
+        sa.String(36),
+        sa.ForeignKey(
+            "effect_approvals.id", name="fk_effect_requests_approval_id_effect_approvals"
+        ),
+    )
+    attempts: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=3)
+    #: Monotonic dispatcher claim epoch — +1 ONLY inside the claim CAS;
+    #: 0 = never claimed by dispatcher-aware code.
+    claim_epoch: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, default=0, server_default=sa.text("0")
+    )
+    claim_owner: Mapped[str | None] = mapped_column(sa.String(64))
+    claimed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    claim_deadline: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    #: Latest submission marker (per-attempt; the durable "submitted at
+    #: least once" fact is never cleared — a retry re-submission overwrites
+    #: it, and the full per-attempt history lives in ``effect_events``).
+    #: NOT proof of provider receipt (local intent record only).
+    submitted_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    ack_deadline: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    acknowledged_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    final_outcome_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    #: Terminal-time provenance: ``provider_ack`` | ``reconciliation`` | ``manual:test-only``.
+    outcome_source: Mapped[str | None] = mapped_column(sa.String(32))
+    cancel_reason: Mapped[str | None] = mapped_column(sa.String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
+class EffectApproval(Base):
+    """A human-approval binding for high-impact synthetic effects (R02-B2 E1).
+
+    E1 SYNTHETIC TEST-ONLY policy (labeled; the real approval workflow is an
+    owner decision — D5): an approval binds to the EXACT canonical operation
+    digest (``bound_request_digest``), is single-use (``used_at`` is set ONLY
+    on successful authorization, atomically in the same transaction — failed
+    attempts never consume it), and expires. Replay against a different
+    operation therefore fails the digest match.
+    """
+
+    __tablename__ = "effect_approvals"
+
+    id: Mapped[str] = mapped_column(sa.String(36), primary_key=True, default=new_uuid)
+    approver: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    capability: Mapped[str] = mapped_column(sa.String(64), nullable=False, index=True)
+    bound_request_digest: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class EffectEvent(Base):
+    """Immutable state-transition audit record for effect rows (INV-EF-R8).
+
+    PRIVACY: rows carry identifiers, statuses, reasons and epochs ONLY —
+    NEVER operation parameters, credentials or content of any kind.
+    Written in the SAME transaction as the transition it records.
+    """
+
+    __tablename__ = "effect_events"
+
+    id: Mapped[int] = mapped_column(
+        sa.BigInteger().with_variant(sa.Integer(), "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    effect_id: Mapped[str] = mapped_column(sa.String(36), nullable=False, index=True)
+    from_status: Mapped[str | None] = mapped_column(sa.String(32))
+    to_status: Mapped[str] = mapped_column(sa.String(32), nullable=False)
+    reason: Mapped[str | None] = mapped_column(sa.String(64))
+    claim_epoch: Mapped[int | None] = mapped_column(sa.Integer)
+    owner: Mapped[str | None] = mapped_column(sa.String(64))
+    occurred_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, default=utc_now, index=True
+    )
+
+
 ALL_MODELS: Sequence[type[Base]] = (
     Agent,
     AgentCredential,
@@ -538,5 +691,8 @@ ALL_MODELS: Sequence[type[Base]] = (
     SecurityEvent,
     SystemState,
     QuotaCounter,
+    EffectApproval,
+    EffectRequest,
+    EffectEvent,
 )
 """Every model, in creation order — imported by the Alembic environment."""

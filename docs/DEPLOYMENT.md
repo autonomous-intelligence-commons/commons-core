@@ -315,3 +315,90 @@ custody, cost plan, and step-by-step web-UI instructions) lives in
 and the maintainer-provided milestone record, was prepared, reviewed,
 and then executed (deployed 2026-10-19); it is not a
 production-readiness certification.
+
+## 14. External effects subsystem (R02-B2 E1 — FAKE-ONLY, **NOT DEPLOYED**)
+
+This section documents the FUTURE integration plan for the effect-outbox
+subsystem delivered by R02-B2 E1. **Nothing in this section is currently
+wired into `commons-api` or `commons-worker`:** the dispatcher is a
+standalone module (`commons_core.effects.dispatcher.dispatch_tick`) and no
+process currently runs it. Real external effects remain **PROHIBITED**
+until the separately reviewed E2 stage (process isolation + egress lock).
+
+**State (E1)**: schema (`migration 0003`), gateway, fake-only dispatcher
+and fake provider exist and are test-verified in isolation; the capability
+allowlist contains ONLY synthetic `fx.*` code constants — no real adapter
+exists, no credential exists, and **no environment variable can enable a
+real effect** (`AIC_EFFECTS_ENABLED` exposes the synthetic gateway only).
+
+**Fail-closed activation (when a future stage wires the dispatcher):**
+
+1. `alembic upgrade head` must complete first (`0003` — the outbox tables);
+2. effects-aware code refuses to dispatch against a `0002`-only schema
+   (`verify_effects_schema` — the same fail-closed doctrine as the `0002`
+   lease-fencing startup gate; a hard error, never a warning);
+3. `AIC_EFFECTS_ENABLED` defaults to **false**: the gateway answers 403
+   `EFFECTS_DISABLED` and the dispatcher scans NOTHING (existing rows are
+   FROZEN, never cleared) until the owner explicitly enables the SYNTHETIC
+   subsystem per environment;
+4. mixed-version windows are unsupported (same blue-green discipline as
+   §3): stop old workers, migrate, start new ones. A pre-0003 binary
+   coexists safely with the 0003 schema (the new tables are inert to it);
+   a post-0003 dispatcher binary against a 0002 schema refuses to start.
+
+**Dispatcher disablement / rollback (freeze doctrine — never drop data):**
+
+- Disabling `AIC_EFFECTS_ENABLED` freezes the outbox: no scans, no
+  submissions, no cancellations — rows await re-enablement. It is the
+  FIRST lever for any incident response;
+- `0003 → 0002` schema downgrade **REFUSES to run while effect rows or
+  effect events exist** (the migration raises; verified by tests). The
+  only safe downgrade precondition is a verified-EMPTY effect system;
+  with live rows the procedure is freeze → reconcile/drain (or export) →
+  then downgrade;
+- rows in `SUBMITTED`/`UNKNOWN` states must never be discarded silently:
+  `UNKNOWN` rows are unresolved *external-outcome* records — closing them
+  requires provider evidence (reconciliation) or the owner-approved
+  manual marking procedure (a real admin interface is deferred to a
+  separately reviewed stage; the E1 function is labeled `manual:test-only`).
+  Reconciliation evidence is **custody-checked** (S1 remediation): a
+  `NEVER_RECEIVED` answer from a fake-provider instance constructed
+  *after* the row's submission (a restarted process — its in-memory
+  ledger is unrecoverable) is treated as INCONCLUSIVE and the row stays
+  `UNKNOWN`; it closes as `FAILED` only when the answering instance held
+  receipt custody over the submission. Equally, every asynchronous
+  acknowledgment is bound to its **originating claim epoch** (S2
+  remediation): a pump-delivered ack carries the submitting attempt's
+  epoch/owner, stale epochs are rejected with zero bytes, and an ack
+  without provenance is rejected fail-closed (audited) — never silently
+  attributed to the current dispatcher attempt. Acknowledgment
+  authorization requires the **complete originating attempt identity**
+  (S3 remediation): an ack missing either its epoch or its owner is
+  rejected fail-closed — the row's current epoch/owner is never
+  substituted for missing ack-origin identity (one deduplicated audit
+  marker per effect row bounds repeated-invalid-ack noise) — and an ack
+  naming a non-matching owner is rejected with zero bytes *before* any
+  terminal-state shortcut, so no wrong-owner attempt can obtain an
+  idempotent confirmation from an already-`SUCCEEDED` row;
+- rolling back the BINARY while leaving the 0003 schema is safe (the old
+  binary never imports the effects package — inert tables, zero behavior
+  change on the task axis).
+
+**Emergency stop dual axis (design §4.6-5, EFF-11/12):** the existing
+emergency stop keeps its task-axis semantics untouched; on the effect
+axis, an engaged stop (1) refuses new effect requests (503 `SERVICE_PAUSED`,
+symmetric with task creation) and (2) cancels all pre-submission rows
+(reason `emergency_stop`) — while rows already `SUBMITTED` are frozen
+(no acks applied, no submissions) until the stop is released; they then
+complete or reconcile honestly. There is **no path** from `SUBMITTED`
+(or any post-submission state) to `CANCELLED` — a submitted effect is
+never reported as cancelled (it may already have been applied).
+
+**E2 prerequisites (owner decision D8 — all required before any real
+adapter):** dispatcher extracted to a separate process with its own
+credentials (the `scripts/run_worker.py` "workers receive NO
+AIC_MASTER_KEYS" precedent), an egress allow-list that permits outbound
+traffic ONLY from the dispatcher process, the full DG-E gate set, an
+operational runbook rehearsal, and explicit owner approval of the first
+real capability class. Until then every real-effect path remains
+structurally absent, not merely disabled.

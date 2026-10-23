@@ -102,3 +102,52 @@ class SecurityEventCategory(enum.StrEnum):
     POLICY_VIOLATION = "policy_violation"
     EMERGENCY_STOP = "emergency_stop"
     CONTAINMENT = "containment"
+
+
+class EffectStatus(enum.StrEnum):
+    """Lifecycle status of a durable external-effect request (R02-B2 E1).
+
+    Phase 0 (P0-C1) corrected lifecycle — the dispatcher claim, the submission
+    intent and the provider outcome are DISTINCT durable facts:
+
+    - ``AUTHORIZED``  — authorized and durably queued; NOT claimed.
+    - ``CLAIMED``      — a dispatcher holds an atomic claim (``claim_epoch``);
+                        NOTHING has been submitted (zero remote meaning).
+    - ``SUBMITTED``    — the submission marker is committed (the point of no
+                        return for cancellation); a LOCAL intent record, NOT
+                        proof of provider receipt.
+    - ``SUCCEEDED`` / ``FAILED`` / ``FAILED_RETRYABLE`` — provider-definitive.
+    - ``UNKNOWN``      — submitted, outcome not established; NEVER implicitly
+                        ``FAILED`` ("no local record" is not "did not happen").
+    - ``CANCELLED``    — cancelled BEFORE submission (reachable only from
+                        AUTHORIZED/CLAIMED with ``submitted_at IS NULL``).
+    - ``EXPIRED``      — lease superseded / TTL expired / integrity freeze,
+                        always before submission; terminal.
+
+    Structural bans: no path leads SUBMITTED→CANCELLED; UNKNOWN leaves only
+    via reconciliation or (test-only, labeled) manual marking; terminal
+    states never flip. Compensation states are deferred to E2.
+    """
+
+    AUTHORIZED = "authorized"
+    CLAIMED = "claimed"
+    SUBMITTED = "submitted"
+    SUCCEEDED = "succeeded"
+    FAILED_RETRYABLE = "failed_retryable"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
+class EffectRiskLevel(enum.StrEnum):
+    """Risk classification of an effect capability (R02-B2 design §4.7).
+
+    E1 registers ONLY synthetic fake-provider capabilities; ``irreversible``
+    has NO members in the E1 allowlist (structurally impossible).
+    """
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    IRREVERSIBLE = "irreversible"

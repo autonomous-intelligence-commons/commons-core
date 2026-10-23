@@ -86,6 +86,34 @@ class Settings(BaseSettings):
             raise ValueError(f"AIC_ENV must be one of {sorted(KNOWN_ENVS)} (got {value!r})")
         return normalized
 
+    @field_validator("effects_claim_deadline_seconds")
+    @classmethod
+    def _validate_claim_deadline(cls, value: int) -> int:
+        if not 1 <= value <= 600:
+            raise ValueError("effects_claim_deadline_seconds must be within 1..600")
+        return value
+
+    @field_validator("effects_ack_window_seconds")
+    @classmethod
+    def _validate_ack_window(cls, value: int) -> int:
+        if not 1 <= value <= 3600:
+            raise ValueError("effects_ack_window_seconds must be within 1..3600")
+        return value
+
+    @field_validator("effects_authorization_ttl_seconds")
+    @classmethod
+    def _validate_auth_ttl(cls, value: int) -> int:
+        if not 10 <= value <= 86400:
+            raise ValueError("effects_authorization_ttl_seconds must be within 10..86400")
+        return value
+
+    @field_validator("effects_max_in_flight")
+    @classmethod
+    def _validate_max_in_flight(cls, value: int) -> int:
+        if not 1 <= value <= 10000:
+            raise ValueError("effects_max_in_flight must be within 1..10000")
+        return value
+
     # --- Quotas / limits (spec §19) ------------------------------------------
     rate_limit_per_minute: int = 120
     # Anonymous (unauthenticated) requests are throttled more tightly.
@@ -98,6 +126,24 @@ class Settings(BaseSettings):
     max_task_attempts: int = 3
     task_timeout_seconds: int = 30
     retention_security_events_days: int = 14
+
+    # --- External effects (R02-B2 E1 — FAKE-ONLY; REAL EFFECTS PROHIBITED) -----
+    # Master switch for the SYNTHETIC effect gateway. Fail-closed default:
+    # False means every gateway request gets 403 EFFECTS_DISABLED and the
+    # dispatcher scans NOTHING (existing rows are frozen, never cleared —
+    # INV-EF-R11). Enabling this via environment exposes ONLY the synthetic
+    # fx.* allowlist (code constants); real effects remain structurally
+    # impossible until a separately reviewed E2 change (prompt §6.6).
+    effects_enabled: bool = False
+    # Dispatcher claim deadline (CLAIMED rows older than this are requeued).
+    effects_claim_deadline_seconds: int = 30
+    # Ack window: SUBMITTED rows unanswered past this window become UNKNOWN
+    # (NEVER FAILED — "no local record" is not "did not happen").
+    effects_ack_window_seconds: int = 60
+    # Authorization TTL: AUTHORIZED rows never claimed past this age EXPIRE.
+    effects_authorization_ttl_seconds: int = 300
+    # Global bound on non-terminal effect rows (bounded outbox → 429).
+    effects_max_in_flight: int = 1000
 
     # --- Logging (spec §11/§20) -----------------------------------------------
     # Privacy rule: logs carry categories, handles/ids and counts only —
