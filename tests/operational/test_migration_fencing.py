@@ -82,8 +82,9 @@ class TestSQLiteMigrationRoundTrip:
     def test_upgrade_downgrade_upgrade_round_trip_with_default_zero(self, tmp_path) -> None:
         url = _sqlite_url(tmp_path)
 
-        # 0001 → 0002 (upgrade head from scratch)
-        _run_alembic(url, "upgrade", "head")
+        # 0001 → 0002 (pinned revision — the chain advanced to 0003 with
+        # R02-B2 E1, so this test no longer uses "head")
+        _run_alembic(url, "upgrade", "0002")
         cols = _columns(url)
         assert COLUMN in cols
 
@@ -118,11 +119,11 @@ class TestSQLiteMigrationRoundTrip:
         assert gen == 0  # classified, not backfilled: never-claimed ⇒ epoch 0
 
         # 0002 → 0001 (batch-mode column drop on SQLite)
-        _run_alembic(url, "downgrade", "-1")
+        _run_alembic(url, "downgrade", "0001")
         assert COLUMN not in _columns(url)
 
         # 0001 → 0002 again (idempotent re-upgrade; existing row classified)
-        _run_alembic(url, "upgrade", "head")
+        _run_alembic(url, "upgrade", "0002")
         engine = create_engine(url)
         with engine.begin() as conn:
             gen = conn.execute(
@@ -176,12 +177,14 @@ class TestPostgresMigrationRoundTrip:
         admin.dispose()
 
         try:
-            _run_alembic(scratch_url, "upgrade", "head")
+            # Pinned revisions (R02-B2 E1 advanced the chain to 0003; this
+            # test exercises the 0002 ⇄ 0001 lease-fencing boundary itself).
+            _run_alembic(scratch_url, "upgrade", "0002")
             assert COLUMN in _columns(scratch_url)
             # native (non-batch) downgrade on PostgreSQL
-            _run_alembic(scratch_url, "downgrade", "-1")
+            _run_alembic(scratch_url, "downgrade", "0001")
             assert COLUMN not in _columns(scratch_url)
-            _run_alembic(scratch_url, "upgrade", "head")
+            _run_alembic(scratch_url, "upgrade", "0002")
             assert COLUMN in _columns(scratch_url)
         finally:
             admin = _ce(admin_url, isolation_level="AUTOCOMMIT")
