@@ -24,7 +24,11 @@ from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
 from commons_core.api.deps import get_session
-from commons_core.infrastructure.system_state import set_emergency_stop
+from commons_core.api.errors import EmergencyStopUnconfirmedError
+from commons_core.infrastructure.system_state import (
+    EmergencyStopStateError,
+    set_emergency_stop,
+)
 from commons_core.infrastructure.telemetry import collect_telemetry
 from commons_core.security.authentication.identity import AuthenticatedAgent
 from commons_core.security.authorization.dependencies import require_admin
@@ -53,8 +57,17 @@ async def engage_emergency_stop(
     worker idles); reads continue. An ``emergency_stop`` security event is
     recorded (action only). Idempotent: engaging while engaged refreshes
     the stored state.
+
+    R04 durability: a 200 response confirms the stop is durably committed;
+    if the required state transition cannot be confirmed the endpoint
+    responds 503 ``EMERGENCY_STOP_UNCONFIRMED`` — never a false success.
     """
-    state = set_emergency_stop(session, active=True, principal=agent.id)
+    try:
+        state = set_emergency_stop(session, active=True, principal=agent.id)
+    except EmergencyStopStateError:
+        # Required transition unconfirmed — report non-success without
+        # leaking internal database details (R04-INV-01/03).
+        raise EmergencyStopUnconfirmedError() from None
     return {"emergency_stop": state}
 
 
@@ -63,6 +76,15 @@ async def release_emergency_stop(
     agent: AuthenticatedAgent = Depends(require_admin),
     session: Session = Depends(get_session),
 ) -> dict:
-    """Release the emergency stop (admin only); normal operation resumes."""
-    state = set_emergency_stop(session, active=False, principal=agent.id)
+    """Release the emergency stop (admin only); normal operation resumes.
+
+    R04 durability: a 200 response confirms the release is durably
+    committed; an unconfirmable transition responds 503
+    ``EMERGENCY_STOP_UNCONFIRMED`` — a failed release is never reported
+    as a successful release.
+    """
+    try:
+        state = set_emergency_stop(session, active=False, principal=agent.id)
+    except EmergencyStopStateError:
+        raise EmergencyStopUnconfirmedError() from None
     return {"emergency_stop": state}

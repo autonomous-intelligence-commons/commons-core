@@ -56,6 +56,30 @@ def emergency_stop_active(session: Session) -> bool:
     return bool((value or {}).get("active"))
 
 
+class EmergencyStopStateError(Exception):
+    """The required emergency-stop transition could not be durably confirmed.
+
+    Internal signal for the admin routes (R04 remediation, 2026-10-30): the
+    requested state is NOT verifiably in effect — the required commit failed
+    and an authoritative fresh-session re-read did not observe the requested
+    state (or the re-read itself failed, leaving the outcome uncertain).
+    Routes must translate this into a non-success response; never a false
+    success (R04-INV-01/03/04).
+    """
+
+
+def _authoritative_stop_state(session: Session) -> dict | None:
+    """Read the persisted emergency-stop value through a FRESH session.
+
+    A new connection bypasses the (possibly broken or rolled-back) request
+    transaction, so the value read here is the durable database state —
+    used to reconcile uncertain commit outcomes.
+    """
+    bind = session.get_bind()
+    with Session(bind=bind) as fresh:
+        return read_system_state(fresh, EMERGENCY_STOP_KEY)
+
+
 def set_emergency_stop(
     session: Session,
     *,
@@ -63,12 +87,29 @@ def set_emergency_stop(
     principal: str,
     now: datetime | None = None,
 ) -> dict:
-    """Engage or release the emergency stop and record the security event.
+    """Engage or release the emergency stop, then record the security event.
 
-    Returns the stored state value. The event details carry the action only
-    (``set``/``clear``) — never content. This function commits (the
-    emergency-stop routes have no other pending writes), matching the
-    ``record_event`` contract.
+    R04 durability contract — two stages:
+
+    1. REQUIRED: the state row is written and committed by this function
+       (explicit durable-state confirmation). A commit failure is
+       reconciled with an authoritative fresh-session re-read: when the
+       durable state already matches the request (an uncertain commit that
+       actually took effect, or an idempotent repeat) the transition is
+       honestly reported as in effect; otherwise
+       :class:`EmergencyStopStateError` is raised and the caller must
+       respond non-success.
+    2. OPTIONAL: the ``emergency_stop`` security event is recorded in its
+       own transaction afterwards. Recording failures are swallowed and
+       logged by ``record_event`` (category only) — an already-committed
+       stop is never undone by an audit failure. AUDIT-LOSS POLICY: a
+       failed event is dropped without retry; there is no exactly-once
+       audit guarantee (documented non-atomicity, R04-INV-09).
+
+    Both stages commit the session they are given: pass a session without
+    unrelated pending writes (the admin emergency-stop routes satisfy
+    this — they have no other pending domain writes). The event details
+    carry the action only (``set``/``clear``) — never content.
     """
     now = now or utc_now()
     write_system_state(
@@ -80,6 +121,23 @@ def set_emergency_stop(
             "set_by": principal,
         },
     )
+    try:
+        session.commit()
+    except Exception:
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
+        try:
+            persisted = _authoritative_stop_state(session)
+        except Exception:  # noqa: BLE001 — outcome stays uncertain
+            persisted = None
+        if bool((persisted or {}).get("active")) != bool(active):
+            raise EmergencyStopStateError(
+                "emergency-stop state transition not durably confirmed"
+            ) from None
+        # The durable state already matches the request (uncertain commit
+        # that took effect, or an idempotent repeat): honest success.
     record_event(
         session,
         SecurityEventCategory.EMERGENCY_STOP,
