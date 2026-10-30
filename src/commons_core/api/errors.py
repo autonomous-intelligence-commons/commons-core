@@ -99,11 +99,12 @@ class EmergencyStopUnconfirmedError(DomainError):
     """The emergency-stop state change could not be durably confirmed (503).
 
     Raised when the REQUIRED durable state transition failed, or its commit
-    outcome could not be verified against the database (R04 remediation,
-    2026-10-30). The response carries no internal database details: the
-    administrator should re-read admin telemetry or retry the operation to
-    reconcile the actual state. A confirmed 200 always corresponds to a
-    verified durable transition.
+    outcome could not be verified against the database as established by
+    this administrator's command (R04 remediation, 2026-10-30; attribution
+    strengthened by the R04-REV-01 follow-up). The response carries no
+    internal database details: the administrator should re-read admin
+    telemetry or retry the operation to reconcile the actual state. A
+    confirmed 200 always corresponds to a verified durable transition.
     """
 
     status_code = 503

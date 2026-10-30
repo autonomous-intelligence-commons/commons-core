@@ -58,9 +58,14 @@ async def engage_emergency_stop(
     recorded (action only). Idempotent: engaging while engaged refreshes
     the stored state.
 
-    R04 durability: a 200 response confirms the stop is durably committed;
-    if the required state transition cannot be confirmed the endpoint
-    responds 503 ``EMERGENCY_STOP_UNCONFIRMED`` — never a false success.
+    R04 durability: a 200 response confirms the stop is durably committed
+    and attributed to this administrator's command; if the required state
+    transition cannot be confirmed the endpoint responds 503
+    ``EMERGENCY_STOP_UNCONFIRMED`` — never a false success (R04-INV-01).
+    Success is a state-convergence contract (R04-REV-01): an idempotent
+    re-issuance is equivalent to the original command, and a concurrent
+    command from another administrator may supersede the state after the
+    response (last-writer-wins; admin telemetry is authoritative).
     """
     try:
         state = set_emergency_stop(session, active=True, principal=agent.id)
@@ -79,9 +84,10 @@ async def release_emergency_stop(
     """Release the emergency stop (admin only); normal operation resumes.
 
     R04 durability: a 200 response confirms the release is durably
-    committed; an unconfirmable transition responds 503
-    ``EMERGENCY_STOP_UNCONFIRMED`` — a failed release is never reported
-    as a successful release.
+    committed and attributed to this administrator's command; an
+    unconfirmable transition responds 503 ``EMERGENCY_STOP_UNCONFIRMED``
+    — a failed release is never reported as a successful release.
+    State-convergence semantics apply symmetrically (R04-REV-01).
     """
     try:
         state = set_emergency_stop(session, active=False, principal=agent.id)

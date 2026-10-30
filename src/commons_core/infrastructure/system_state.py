@@ -60,11 +60,12 @@ class EmergencyStopStateError(Exception):
     """The required emergency-stop transition could not be durably confirmed.
 
     Internal signal for the admin routes (R04 remediation, 2026-10-30): the
-    requested state is NOT verifiably in effect — the required commit failed
-    and an authoritative fresh-session re-read did not observe the requested
-    state (or the re-read itself failed, leaving the outcome uncertain).
-    Routes must translate this into a non-success response; never a false
-    success (R04-INV-01/03/04).
+    requested state is NOT verifiably in effect — the required write or
+    commit failed, and an authoritative fresh-session re-read did not
+    observe the requested state established by THIS principal (or the
+    re-read itself failed, leaving the outcome uncertain). Routes must
+    translate this into a non-success response; never a false success
+    (R04-INV-01/03/04).
     """
 
 
@@ -92,11 +93,15 @@ def set_emergency_stop(
     R04 durability contract — two stages:
 
     1. REQUIRED: the state row is written and committed by this function
-       (explicit durable-state confirmation). A commit failure is
-       reconciled with an authoritative fresh-session re-read: when the
-       durable state already matches the request (an uncertain commit that
-       actually took effect, or an idempotent repeat) the transition is
-       honestly reported as in effect; otherwise
+       (explicit durable-state confirmation). A write or commit failure is
+       reconciled with an authoritative fresh-session re-read: the
+       transition is honestly reported as in effect only when the durable
+       state matches the request BOTH in ``active`` AND in attribution
+       (``set_by == principal``) — i.e. this principal's command (or an
+       idempotent re-issuance of it) is the one durably established. A
+       same-value state written by a DIFFERENT administrator does not
+       count: this command's success is not overstated and the audit event
+       is never mis-attributed (R04-REV-01). Otherwise
        :class:`EmergencyStopStateError` is raised and the caller must
        respond non-success.
     2. OPTIONAL: the ``emergency_stop`` security event is recorded in its
@@ -106,22 +111,30 @@ def set_emergency_stop(
        failed event is dropped without retry; there is no exactly-once
        audit guarantee (documented non-atomicity, R04-INV-09).
 
+    SUCCESS CONTRACT (R04-REV-01, state-convergence semantics): a returned
+    state (HTTP 200) certifies that the requested emergency-stop state was
+    durably established in the database and attributed to this principal at
+    response time. It is NOT a distributed exactly-once command
+    acknowledgment: an idempotent re-issuance by the same principal is
+    indistinguishable from — and operationally equivalent to — the original
+    command's success, and a concurrent command from another administrator
+    may supersede the state after the response (last-writer-wins; admin
+    telemetry is the authoritative source for the current state).
+
     Both stages commit the session they are given: pass a session without
     unrelated pending writes (the admin emergency-stop routes satisfy
     this — they have no other pending domain writes). The event details
     carry the action only (``set``/``clear``) — never content.
     """
     now = now or utc_now()
-    write_system_state(
-        session,
-        EMERGENCY_STOP_KEY,
-        {
-            "active": bool(active),
-            "set_at": now.isoformat(),
-            "set_by": principal,
-        },
-    )
+    requested = {
+        "active": bool(active),
+        "set_at": now.isoformat(),
+        "set_by": principal,
+    }
+    confirmed_state: dict | None = None
     try:
+        write_system_state(session, EMERGENCY_STOP_KEY, requested)
         session.commit()
     except Exception:
         try:
@@ -132,16 +145,29 @@ def set_emergency_stop(
             persisted = _authoritative_stop_state(session)
         except Exception:  # noqa: BLE001 — outcome stays uncertain
             persisted = None
-        if bool((persisted or {}).get("active")) != bool(active):
+        confirmed = (
+            persisted is not None
+            and bool(persisted.get("active")) == bool(active)
+            and persisted.get("set_by") == principal
+        )
+        if not confirmed:
             raise EmergencyStopStateError(
                 "emergency-stop state transition not durably confirmed"
             ) from None
-        # The durable state already matches the request (uncertain commit
-        # that took effect, or an idempotent repeat): honest success.
+        # The durable state already matches this principal's request
+        # (uncertain commit that took effect, or an idempotent repeat):
+        # honest success, reported from the authoritative read. Fall
+        # through to the optional event stage — the converged command is
+        # still audited under this principal.
+        confirmed_state = dict(persisted)
     record_event(
         session,
         SecurityEventCategory.EMERGENCY_STOP,
         principal,
         {"action": "set" if active else "clear"},
     )
-    return read_system_state(session, EMERGENCY_STOP_KEY) or {}
+    if confirmed_state is not None:
+        return confirmed_state
+    # The requested state was committed by this very transaction; return it
+    # directly rather than re-reading (avoids post-commit read races).
+    return dict(requested)
