@@ -22,8 +22,11 @@ Authorization model (documented decision):
 Ordering & delivery guarantees (honest, spec §9):
 - Per-channel ``sequence`` is monotonically increasing, assigned as
   ``max(sequence) + 1`` and protected by the ``UNIQUE(channel_id, sequence)``
-  constraint with up to 3 retries on conflict (SQLite-safe; no
-  ``SELECT ... FOR UPDATE``).
+  constraint with up to 3 retries on conflict. Each attempt inserts inside a
+  SAVEPOINT (``session.begin_nested()``): a conflict rolls back ONLY the
+  message insert, preserving the caller's earlier pending writes in the same
+  transaction (R06-A — a quota admission taken before the send is never
+  silently discarded by the retry).
 - Retrieval is cursor-based (``sequence > after``) and therefore
   AT-LEAST-ONCE from the reader's perspective; duplicates are impossible
   within a single ordered scan, but re-reads overlap. NO exactly-once
@@ -363,16 +366,17 @@ def send_message(
             sequence=sequence,
             size_bytes=size_bytes,
         )
-        session.add(message)
         try:
-            session.flush()
+            # SAVEPOINT scope: a (channel_id, sequence) conflict rolls back
+            # ONLY this message insert. Earlier pending writes of the SAME
+            # transaction — notably the atomic quota admission taken by the
+            # route before calling send_message — are preserved, and the
+            # retry recomputes the maximum (R06-A).
+            with session.begin_nested():
+                session.add(message)
+                session.flush()
             return message
         except IntegrityError:
-            # Concurrent writer won this (channel_id, sequence) slot: rollback
-            # (also discards any pending writes of THIS transaction — the
-            # route calls send_message before other mutations) and retry with
-            # the recomputed maximum.
-            session.rollback()
             if attempt == _SEQUENCE_ATTEMPTS - 1:
                 raise SequenceConflictError() from None
     raise SequenceConflictError()  # pragma: no cover
