@@ -62,7 +62,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2, SHA-pinned
       - name: Set up Python 3.12
         uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
         with:
@@ -81,7 +81,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2, SHA-pinned
       - name: Set up Python 3.12
         uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
         with:
@@ -153,7 +153,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2, SHA-pinned
       - name: Set up Python 3.12
         uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
         with:
@@ -201,7 +201,7 @@ jobs:
       AIC_TEST_DATABASE_URL: postgresql+psycopg://commons:commons-ci@localhost:5432/commons
     steps:
       - name: Check out repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2, SHA-pinned
       - name: Set up Python 3.12
         uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
         with:
@@ -298,7 +298,7 @@ jobs:
           --health-retries 12
     steps:
       - name: Check out repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2, SHA-pinned
       - name: Set up Python 3.12
         uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
         with:
@@ -376,7 +376,7 @@ jobs:
       AIC_API_PORT: "8010"
     steps:
       - name: Check out repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2, SHA-pinned
       - name: Build the production image
         run: docker build -t commons-core:ci .
       - name: Confirm the image runs as a non-root user
@@ -572,7 +572,7 @@ jobs:
       AIC_DATABASE_URL: "sqlite+pysqlite:////tmp/migrate-check.db"
     steps:
       - name: Check out repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2, SHA-pinned
       - name: Set up Python 3.12
         uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
         with:
@@ -601,7 +601,7 @@ jobs:
     continue-on-error: true
     steps:
       - name: Check out repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4.2.2, SHA-pinned
       - name: Set up Python 3.12
         uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
         with:
