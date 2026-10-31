@@ -11,25 +11,25 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
-    "alembic==1.20.0",
+    "alembic==1.20.1",
     "cryptography==50.0.2",
-    "fastapi==0.143.3",
+    "fastapi==0.162.0",
     "pydantic==2.14.1",
-    "pydantic-settings==2.16.0",
-    "SQLAlchemy==2.1.5",
+    "pydantic-settings==2.16.2",
+    "SQLAlchemy==2.1.6",
     "uvicorn==0.54.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "httpx==0.28.1",
-    "pytest==9.1.1",
-    "ruff==0.17.1",
+    "pytest==9.2.0",
+    "ruff==0.17.3",
 ]
 # PostgreSQL integration target (matches the Dockerfile pin). Install with
 # `pip install -e ".[postgres]"` (or ".[dev,postgres]" for the full suite).
 postgres = [
-    "psycopg[binary]==3.2.13",
+    "psycopg[binary]==3.3.6",
 ]
 
 [tool.setuptools]
