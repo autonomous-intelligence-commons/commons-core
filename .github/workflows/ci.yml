@@ -64,7 +64,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
+        uses: actions/setup-python@v7 # TODO: pin to commit SHA after first verified run
         with:
           python-version: "3.12"
       - name: Install ruff (project pin)
@@ -83,7 +83,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
+        uses: actions/setup-python@v7 # TODO: pin to commit SHA after first verified run
         with:
           python-version: "3.12"
       # ".[dev,postgres]": the suite includes production fail-closed startup
@@ -155,7 +155,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
+        uses: actions/setup-python@v7 # TODO: pin to commit SHA after first verified run
         with:
           python-version: "3.12"
       # ".[dev]": the root tests/conftest.py imports the application at module
@@ -203,7 +203,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
+        uses: actions/setup-python@v7 # TODO: pin to commit SHA after first verified run
         with:
           python-version: "3.12"
       - name: Install application + dev + postgres dependencies (pinned)
@@ -300,7 +300,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
+        uses: actions/setup-python@v7 # TODO: pin to commit SHA after first verified run
         with:
           python-version: "3.12"
       - name: Install application + dev + postgres dependencies (pinned)
@@ -574,7 +574,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
+        uses: actions/setup-python@v7 # TODO: pin to commit SHA after first verified run
         with:
           python-version: "3.12"
       - name: Install application (pinned)
@@ -603,7 +603,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, SHA-pinned
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5 # TODO: pin to commit SHA after first verified run
+        uses: actions/setup-python@v7 # TODO: pin to commit SHA after first verified run
         with:
           python-version: "3.12"
       - name: Install application + pip-audit
