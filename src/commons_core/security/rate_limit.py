@@ -4,11 +4,15 @@ Design:
 - In-memory fixed-window counters are the AUTHORITATIVE limiter (fast, works
   even when the database is degraded). Honest limitation: counters are
   per-process — correct for the single-process Phase 1 deployment; a
-  multi-worker deployment needs a shared store (noted for Agent B / ops).
+  multi-worker deployment needs a shared store (noted for Agent B / ops;
+  R06-B B1 is OPEN on exactly this point).
 - For authenticated principals the current window's request count is ALSO
   mirrored into the ``QuotaCounter`` table (best-effort, durable telemetry
   for quota decisions); anonymous traffic is never persisted (privacy: no
-  IP-keyed rows).
+  IP-keyed rows). The mirror is ATOMIC (R06-B F.1): one conditional UPSERT
+  creates the window row and increments the request counter, so concurrent
+  mirrors cannot lose increments and the first-window creation race
+  resolves through the primary-key conflict path.
 
 Usage by the middleware: one ``check(principal)`` per request before the
 route runs; denied requests return HTTP 429 and a ``rate_limited`` security
@@ -19,6 +23,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from commons_core.database.models import QuotaCounter
@@ -97,14 +103,42 @@ def persist_request_count(
 
     Best-effort durable telemetry (Agent B builds quota decisions on it).
     The caller owns the transaction.
+
+    Atomicity (R06-B F.1): one conditional UPSERT — ``INSERT ... ON CONFLICT
+    (agent_id, window_start) DO UPDATE SET requests = requests + :amount`` —
+    creates the window row and increments the counter in a single statement.
+    Concurrent mirrors can no longer lose increments (the increment is
+    re-evaluated against the latest row version under the conflict arbiter),
+    and the first-window creation race resolves through the primary-key
+    conflict path instead of an escaped IntegrityError. The statement runs
+    inside the caller's transaction and bypasses the ORM identity map —
+    ``QuotaCounter`` objects already loaded in THIS session are not
+    refreshed by it (read back through a fresh session, as callers in the
+    middleware do). Admission authority (the in-memory limiter) and the
+    best-effort failure policy are unchanged; anonymous traffic is never
+    persisted (the only production caller invokes this for authenticated
+    agents).
     """
     window_start = as_utc(window_start)
-    counter = session.get(QuotaCounter, (agent_id, window_start))
-    if counter is None:
-        counter = QuotaCounter(
-            agent_id=agent_id, window_start=window_start, requests=amount, messages=0
+    dialect = session.get_bind().dialect.name
+    if dialect == "postgresql":
+        insert = pg_insert
+    elif dialect == "sqlite":
+        insert = sqlite_insert
+    else:  # pragma: no cover — defensive: fail loud on unknown backends
+        raise RuntimeError(f"unsupported dialect for atomic request persistence: {dialect!r}")
+    statement = (
+        insert(QuotaCounter)
+        .values(
+            agent_id=agent_id,
+            window_start=window_start,
+            requests=amount,
+            messages=0,
+            updated_at=utc_now(),
         )
-        session.add(counter)
-    else:
-        counter.requests += amount
-    session.flush()
+        .on_conflict_do_update(
+            index_elements=[QuotaCounter.agent_id, QuotaCounter.window_start],
+            set_={"requests": QuotaCounter.requests + amount, "updated_at": utc_now()},
+        )
+    )
+    session.execute(statement)

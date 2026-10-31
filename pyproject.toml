@@ -59,3 +59,12 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    # R06-B B1 (shared admission across limiter instances / processes) is
+    # OPEN: these reproduction scenarios are INTENTIONALLY FAILING until the
+    # approved shared-admission workstream lands. The F.1 acceptance gate
+    # deselects them with `-m "not r06b_open"`; a separate non-blocking run
+    # reports them so the unresolved status stays visible (never a silent
+    # skip). Remove the marker when B1 turns green.
+    "r06b_open: R06-B B1 shared-admission scenarios, expected to fail while B1 is OPEN (outside R06-B F.1 scope)",
+]
