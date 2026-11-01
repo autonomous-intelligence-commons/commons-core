@@ -1,5 +1,7 @@
 """Integration tests for the FastAPI foundation (health, auth, rate limit)."""
 
+from datetime import UTC, datetime
+
 import pytest
 from conftest import auth_headers, provision_and_login
 from fastapi.testclient import TestClient
@@ -8,6 +10,13 @@ from sqlalchemy import select
 from commons_core.agents.service import get_agent_by_handle, suspend_agent
 from commons_core.api.app import create_app
 from commons_core.database.models import QuotaCounter, SecurityEvent
+from commons_core.security.rate_limit import RateLimiter
+
+#: Frozen clock for the rate-limit tests (R06-B F.2 / open risk R4): the
+#: admission window and the 429 ``Retry-After`` are derived from the
+#: limiter's injectable clock, so freezing it mid-window makes these tests
+#: deterministic across real minute boundaries.
+_FROZEN_NOW = datetime(2026, 11, 1, 12, 0, 15, 123456, tzinfo=UTC)
 
 
 class TestHealth:
@@ -96,6 +105,8 @@ class TestRateLimit:
     def limited_client(self, settings, database) -> TestClient:
         limited_settings = settings.model_copy(update={"rate_limit_per_minute": 3})
         application = create_app(settings=limited_settings, database=database)
+        # Frozen clock: deterministic window + Retry-After (R4 flake fix).
+        application.state.rate_limiter = RateLimiter(per_agent_limit=3, clock=lambda: _FROZEN_NOW)
         with TestClient(application) as test_client:
             yield test_client
 
@@ -125,13 +136,21 @@ class TestRateLimit:
         assert events[0].details["limit"] == 3
         assert events[0].details["authenticated"] is True
 
-    def test_quota_counter_mirrored(self, limited_client: TestClient, database) -> None:
+    def test_quota_counter_admission_durable(self, limited_client: TestClient, database) -> None:
+        """R06-B F.2 upgrade of ``test_quota_counter_mirrored``: the
+        admission statement IS the durable request counter — admitted
+        requests persist exactly one increment each, denials none."""
         token = provision_and_login(limited_client, "agent-quota")
-        limited_client.get("/api/v1/agents/me", headers=auth_headers(token))
+        for _ in range(3):
+            response = limited_client.get("/api/v1/agents/me", headers=auth_headers(token))
+            assert response.status_code == 200
+        # At the shared limit: denied (429), and the denial performs no write.
+        denied = limited_client.get("/api/v1/agents/me", headers=auth_headers(token))
+        assert denied.status_code == 429
         with database.session() as session:
             counters = list(session.scalars(select(QuotaCounter)))
         assert len(counters) == 1
-        assert counters[0].requests == 1
+        assert counters[0].requests == 3, counters[0].requests
 
     def test_anonymous_requests_limited(self, settings, database) -> None:
         anonymous_settings = settings.model_copy(update={"anonymous_rate_limit_per_minute": 2})

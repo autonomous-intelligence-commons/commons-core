@@ -2,12 +2,19 @@
 
 Independently developed reproduction scenarios (R06-B — Independent
 Reproduction and Remediation Readiness Review, baseline ``c418110``;
-remediation status per R06-B F.1):
+remediation status per R06-B F.1 / F.2):
 
-- B1  shared-principal admission across independent limiter instances
-  - B1-c  control: ONE instance enforces the per-agent limit correctly
-  - B1-i  two independent in-process instances, frozen clock, limit=3
-  - B1-p  genuine multi-process (spawn) reproduction
+- B1  shared-principal admission across independent admission paths —
+  REMEDIATED by R06-B F.2 (database-atomic shared admission)
+  - B1-c  control: ONE in-memory limiter enforces the anonymous-limit
+    contract correctly (the limiter remains authoritative for anonymous
+    traffic only)
+  - B1-i  two independent APPLICATION instances (isolated limiter
+    objects, frozen clock, shared database, same authenticated
+    principal) — combined admission through the PRODUCTION middleware
+  - B1-p  genuine multi-process (spawn) reproduction — two cold-start
+    workers admitting through the PRODUCTION ``admit_request`` against
+    one shared PostgreSQL store
 - B2  concurrent ``persist_request_count()`` lost-update (PostgreSQL) —
   REMEDIATED by R06-B F.1 (atomic UPSERT)
 - B3  simultaneous first-window creation race (PostgreSQL) — REMEDIATED
@@ -40,22 +47,15 @@ deadlock-prone barrier):
 - Final persisted counters are always re-read through a FRESH session after
   both racers join (authoritative read-back, never a racer's stale ORM copy).
 
-These scenarios assert the SPEC-correct behaviour. B2/B3/B4-c (remediated
-by R06-B F.1) and the controls (B1-c, B4-s, B5) must PASS. The B1 sharing
-scenarios (B1-i, B1-p) are EXPECTED TO FAIL while B1 remains OPEN — B1
-(shared admission across limiter instances / processes) is explicitly
-outside the authorized F.1 production scope, which only atomizes the
-durable request counter. To keep that unresolved status visible without
-misrepresenting CI as fully green, the B1 scenarios carry the
-``r06b_open`` marker: the F.1 acceptance gate runs ``-m "not r06b_open"``
-while a separate non-blocking run reports ``-m r06b_open``. When the
-approved shared-admission workstream (R06-B F.2) lands, these tests must
-turn green and the marker must be removed.
-
-B1 is backend-independent (pure in-memory limiter). B2/B3/B4 target
-PostgreSQL (the deployment backend whose multi-writer semantics expose the
-read-modify-write races) and skip when ``AIC_TEST_DATABASE_URL`` is not
-configured. B5 runs on every backend.
+These scenarios assert the SPEC-correct behaviour: B1 (remediated by
+R06-B F.2 — the B1-i/B1-p reproductions now exercise the production
+database-atomic shared admission and MUST PASS on every backend where
+they run), B2/B3/B4-c (remediated by R06-B F.1) and the controls
+(B1-c, B4-s, B5). The temporary ``r06b_open`` marker machinery was
+removed together with this remediation: B1-i runs on every backend
+through the production middleware; B1-p runs on PostgreSQL (the
+development/deployment multi-writer backend) and is skipped with an
+explicit reason where ``AIC_TEST_DATABASE_URL`` is unset.
 """
 
 import multiprocessing
@@ -66,18 +66,24 @@ from datetime import UTC, datetime
 
 import pytest
 from conftest import PG_TEST_URL
+from fastapi.testclient import TestClient
 from sqlalchemy import event, select, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from commons_core.agents.service import provision_agent
+from commons_core.api.app import create_app
 from commons_core.database.enums import SecurityEventCategory
 from commons_core.database.models import QuotaCounter, SecurityEvent
 from commons_core.infrastructure.quotas import check_message_quota
+from commons_core.security.authentication.tokens import issue_token
 from commons_core.security.rate_limit import RateLimiter, persist_request_count
 
 pg_only = pytest.mark.skipif(
     not PG_TEST_URL,
-    reason="R06-B persistence race scenarios run on PostgreSQL only (AIC_TEST_DATABASE_URL unset)",
+    reason=(
+        "R06-B PostgreSQL-only scenarios (persistence races, multi-process "
+        "shared admission) run on PostgreSQL only (AIC_TEST_DATABASE_URL unset)"
+    ),
 )
 
 #: Bounded wait protecting every racing transaction (seconds).
@@ -187,70 +193,129 @@ class TestB1SingleInstanceControl:
         assert decisions[-1].retry_after_seconds >= 1
 
 
-@pytest.mark.r06b_open
 class TestB1IndependentInstances:
-    """B1-i: two independent in-process instances, shared principal, frozen
-    window — the owner's Windows reproduction, modelled as object isolation
-    (each instance owns a private ``_counts`` mapping).
+    """B1-i: two independent APPLICATION instances, one shared database.
 
-    EXPECTED TO FAIL while B1 is OPEN (outside the R06-B F.1 production
-    scope, which only atomizes the durable request counter). Marked
-    ``r06b_open`` so the F.1 acceptance gate can deselect it without hiding
-    its unresolved status; must turn green when the approved
-    shared-admission workstream (R06-B F.2) lands."""
+    The owner's Windows reproduction (two limiter instances, same
+    principal, frozen window, limit=3), upgraded to the PRODUCTION
+    admission path: each application owns its own isolated limiter object
+    (object isolation preserved — the original B1-i conditions), and both
+    point at the same database, so authenticated admission goes through
+    the database-atomic conditional UPSERT in the middleware.
 
-    def test_two_instances_combined_admission_within_limit(self) -> None:
+    REMEDIATED by R06-B F.2: the combined admission must respect the
+    limit."""
+
+    def test_two_instances_combined_admission_within_limit(self, settings, database) -> None:
         limit = 3
-        east = RateLimiter(per_agent_limit=limit, clock=lambda: _B1_NOW)
-        west = RateLimiter(per_agent_limit=limit, clock=lambda: _B1_NOW)
+        limited = settings.model_copy(update={"rate_limit_per_minute": limit})
+        apps = [create_app(settings=limited, database=database) for _ in range(2)]
+        # Frozen clock on BOTH independent limiter objects: same fixed
+        # window, deterministic Retry-After, no real minute boundary.
+        for application in apps:
+            application.state.rate_limiter = RateLimiter(
+                per_agent_limit=limit, clock=lambda: _B1_NOW
+            )
+        # Object isolation — the original B1-i condition — is preserved.
+        assert apps[0].state.rate_limiter is not apps[1].state.rate_limiter
 
-        admitted_east = sum(1 for _ in range(4) if east.check(_B1_PRINCIPAL).allowed)
-        admitted_west = sum(1 for _ in range(4) if west.check(_B1_PRINCIPAL).allowed)
-        total = admitted_east + admitted_west
+        with database.session() as session:
+            agent = provision_agent(session, "b1-shared-agent")
+            token = issue_token(session, agent.id).raw_token
+        headers = {"Authorization": f"Bearer {token}"}
 
-        # Spec: per-principal admission must be shared across limiter
-        # instances (a multi-worker deployment points several instances at
-        # the same principal). The combined admission must respect the limit.
-        assert total <= limit, (
-            f"independent limiter instances admitted {total} requests combined "
-            f"(east={admitted_east}, west={admitted_west}) for limit={limit} — "
-            "per-principal admission is not shared across instances"
+        statuses: list[int] = []
+        with TestClient(apps[0]) as east, TestClient(apps[1]) as west:
+            for _ in range(4):
+                statuses.append(east.get("/api/v1/agents/me", headers=headers).status_code)
+            for _ in range(4):
+                statuses.append(west.get("/api/v1/agents/me", headers=headers).status_code)
+
+        admitted = statuses.count(200)
+        denied = statuses.count(429)
+        # Spec: per-principal admission must be shared across admission
+        # paths (a multi-worker deployment points several instances at
+        # the same principal). The combined admission must respect the
+        # limit — the original B1-i assertion, unweakened.
+        assert admitted <= limit, (
+            f"independent application instances admitted {admitted} requests combined "
+            f"(statuses={statuses}) for limit={limit} — per-principal admission "
+            "is not shared across instances"
         )
+        # Strengthened: eight attempts against a three-slot window must
+        # fill it exactly; every further request is denied.
+        assert admitted == limit, f"expected the window to fill exactly (statuses={statuses})"
+        assert denied == 2 * 4 - limit, statuses
 
 
-def _b1_spawn_worker(admitted_queue, checks: int, limit: int, frozen_iso: str) -> None:
-    """Genuine separate-process worker: build its own limiter, count.
+def _b1_f2_spawn_worker(
+    result_queue,
+    url: str,
+    agent_id: str,
+    window_iso: str,
+    attempts: int,
+    limit: int,
+) -> None:
+    """Genuine separate-process worker — PRODUCTION admission path.
 
     Must live at module level for the ``spawn`` start method. Runs in a
     pristine interpreter — exactly the memory-isolation model of separate
-    deployment workers."""
-    frozen = datetime.fromisoformat(frozen_iso)
-    limiter = RateLimiter(per_agent_limit=limit, clock=lambda: frozen)
-    admitted = sum(1 for _ in range(checks) if limiter.check(_B1_PRINCIPAL).allowed)
-    admitted_queue.put(admitted)
+    deployment workers — and admits through the production
+    ``commons_core.security.rate_limit.admit_request`` on its own engine
+    and sessions (connect → conditional UPSERT → commit per attempt)."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from commons_core.security.rate_limit import admit_request as production_admit
+
+    window = datetime.fromisoformat(window_iso)
+    engine = create_engine(url, pool_pre_ping=True)
+    factory = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
+    admitted = 0
+    denied = 0
+    errors: list[str] = []
+    try:
+        for _ in range(attempts):
+            try:
+                with factory() as session:
+                    with session.begin():
+                        new_count = production_admit(session, agent_id, window, limit=limit)
+                if new_count is None:
+                    denied += 1
+                else:
+                    admitted += 1
+            except Exception as exc:  # noqa: BLE001 — classified per attempt
+                errors.append(f"{type(exc).__name__}: {exc}"[:120])
+    finally:
+        engine.dispose()
+    result_queue.put((admitted, denied, errors))
 
 
-@pytest.mark.r06b_open
+@pg_only
 class TestB1GenuineMultiprocess:
-    """B1-p: genuine multi-process reproduction (spawn context).
+    """B1-p: genuine multi-process shared-admission verification (spawn).
 
-    Distinguished from B1-i: the limiter state is not merely a second object
-    in the same interpreter — each subprocess builds its own limiter from a
-    cold start, mirroring separate deployment workers (e.g. multiple app
-    processes behind one endpoint).
+    Distinguished from B1-i: the admission path is not merely a second
+    object in the same interpreter — each subprocess cold-starts its own
+    engine and sessions and admits through the PRODUCTION
+    ``admit_request`` against one shared PostgreSQL store, mirroring
+    separate deployment workers behind one endpoint.
 
-    EXPECTED TO FAIL while B1 is OPEN (outside the R06-B F.1 production
-    scope). Marked ``r06b_open`` — see TestB1IndependentInstances."""
+    REMEDIATED by R06-B F.2: the combined admission must respect the
+    limit."""
 
-    def test_two_processes_combined_admission_within_limit(self) -> None:
+    def test_two_processes_combined_admission_within_limit(self, database) -> None:
         limit = 3
-        checks = 4
+        attempts = 4
+        agent_id = _provision_agent(database)
+        window_iso = _window_start().isoformat()
+
         ctx = multiprocessing.get_context("spawn")
-        admitted_queue = ctx.Queue()
+        result_queue = ctx.Queue()
         processes = [
             ctx.Process(
-                target=_b1_spawn_worker,
-                args=(admitted_queue, checks, limit, _B1_NOW.isoformat()),
+                target=_b1_f2_spawn_worker,
+                args=(result_queue, PG_TEST_URL, agent_id, window_iso, attempts, limit),
             )
             for _ in range(2)
         ]
@@ -261,15 +326,28 @@ class TestB1GenuineMultiprocess:
         assert not any(process.is_alive() for process in processes), "worker hung"
         assert all(process.exitcode == 0 for process in processes), "worker crashed"
 
-        per_process = [admitted_queue.get(timeout=_EVENT_WAIT_S) for _ in processes]
+        results = [result_queue.get(timeout=_EVENT_WAIT_S) for _ in processes]
+        errors = [error for _, _, errs in results for error in errs]
+        assert errors == [], errors
+        per_process = [admitted for admitted, _, _ in results]
         total = sum(per_process)
 
-        # Spec: per-principal admission must be shared across processes.
+        # Spec: per-principal admission must be shared across processes —
+        # the original B1-p assertion, unweakened.
         assert total <= limit, (
             f"genuinely separate processes admitted {total} requests combined "
             f"(per-process={per_process}) for limit={limit} — no shared "
             "admission exists across process boundaries"
         )
+        # Strengthened: eight attempts must fill the three-slot window.
+        assert total == limit, (
+            f"two workers x {attempts} attempts should fill the window exactly "
+            f"(got {total}: {results})"
+        )
+
+        with database.session() as session:
+            counter = session.get(QuotaCounter, (agent_id, _window_start()))
+        assert counter is not None and counter.requests == limit, counter
 
 
 # ---------------------------------------------------------------------------
