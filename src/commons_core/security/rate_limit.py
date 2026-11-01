@@ -1,22 +1,23 @@
 """Per-principal fixed-window rate limiting (spec §19, §21).
 
-Design:
-- In-memory fixed-window counters are the AUTHORITATIVE limiter (fast, works
-  even when the database is degraded). Honest limitation: counters are
-  per-process — correct for the single-process Phase 1 deployment; a
-  multi-worker deployment needs a shared store (noted for Agent B / ops;
-  R06-B B1 is OPEN on exactly this point).
-- For authenticated principals the current window's request count is ALSO
-  mirrored into the ``QuotaCounter`` table (best-effort, durable telemetry
-  for quota decisions); anonymous traffic is never persisted (privacy: no
-  IP-keyed rows). The mirror is ATOMIC (R06-B F.1): one conditional UPSERT
-  creates the window row and increments the request counter, so concurrent
-  mirrors cannot lose increments and the first-window creation race
-  resolves through the primary-key conflict path.
-
-Usage by the middleware: one ``check(principal)`` per request before the
-route runs; denied requests return HTTP 429 and a ``rate_limited`` security
-event. The clock is injectable so tests can freeze time.
+Design (R06-B F.2 — owner decisions D1/D2/D3):
+- AUTHENTICATED Agent requests are admitted by the DATABASE-ATOMIC
+  conditional UPSERT (:func:`admit_request`) — one authoritative decision
+  per admitted request, shared across ALL workers pointing at the same
+  database (the R06-B B1 cross-worker over-admission defect is remediated
+  on exactly this point). The middleware runs it inside a dedicated short
+  transaction committed before the request is forwarded downstream; the
+  admission statement IS the durable request counter (the former
+  best-effort telemetry call ``persist_request_count`` is retired from the
+  production path — D3 — and kept temporarily only for compatibility and
+  existing F.1 regression coverage). The failure policy is FAIL-CLOSED
+  (D2): if the authoritative admission cannot be completed, the middleware
+  must refuse the request (HTTP 503), never fall back to this in-memory
+  limiter.
+- ANONYMOUS traffic keeps the in-memory fixed-window limiter below
+  (privacy: no IP-keyed persistent quota rows; no database dependency for
+  anonymous admission).
+- The clock is injectable so tests can freeze time.
 """
 
 from collections.abc import Callable
@@ -45,7 +46,14 @@ class RateLimitDecision:
 
 
 class RateLimiter:
-    """Fixed-window per-minute limiter with an injectable clock."""
+    """Fixed-window per-minute limiter with an injectable clock.
+
+    Authoritative for ANONYMOUS traffic only (R06-B F.2): authenticated
+    Agent admission is decided by the database-atomic
+    :func:`admit_request` in the middleware. This class must never be used
+    as a fallback when that authoritative admission fails (fail-closed
+    policy D2).
+    """
 
     def __init__(
         self,
@@ -88,6 +96,19 @@ class RateLimiter:
             window_start=window,
         )
 
+    def current_window_and_retry(self) -> tuple[datetime, int]:
+        """The current fixed window and its bounded retry hint (1..60 s).
+
+        Uses the limiter's injectable clock so middleware callers (and
+        tests with a frozen clock) derive the authoritative admission
+        window and the 429 ``Retry-After`` value from one consistent
+        source, matching the in-memory ``check`` semantics.
+        """
+        now = as_utc(self._clock())
+        window = now.replace(second=0, microsecond=0)
+        seconds_left = max(1, int((window.timestamp() + _WINDOW_SECONDS - now.timestamp()) + 0.999))
+        return window, seconds_left
+
     def _prune(self, current_window: datetime) -> None:
         """Drop counters from windows older than the previous one."""
         cutoff = current_window.timestamp() - _WINDOW_SECONDS
@@ -96,10 +117,88 @@ class RateLimiter:
             del self._counts[key]
 
 
+def admit_request(
+    session: Session, agent_id: str, window_start: datetime, *, limit: int
+) -> int | None:
+    """Authoritative shared admission for one authenticated Agent request.
+
+    Atomically creates-or-increments the agent's request counter for the
+    fixed window in ONE conditional UPSERT statement (R06-B F.2 / D1, the
+    ``requests``-column sibling of the R06-A ``_atomic_admit``)::
+
+        INSERT INTO quota_counters (agent_id, window_start, requests, ...)
+        VALUES (:agent_id, :window, 1, ...)
+        ON CONFLICT (agent_id, window_start) DO UPDATE
+            SET requests = quota_counters.requests + 1, updated_at = ...
+            WHERE quota_counters.requests < :limit
+        RETURNING requests
+
+    Returns the NEW request count on admission, or ``None`` when the window
+    is already at ``limit`` (denied — the denial path performs no write).
+
+    Contract:
+
+    - One authoritative decision per call; concurrent final-slot and
+      first-window-creation races are arbitrated by the conflict path on
+      both supported backends (PostgreSQL 16 and SQLite >= 3.35), so the
+      persisted count never exceeds ``limit`` through successful
+      admissions, and a denial never increments the counter.
+    - Runs inside the CALLER's transaction: admission and persistence
+      share one transaction outcome, and the decision counts as
+      successful only once that transaction commits (an admission that
+      rolls back returns its slot). Callers must NOT silently retry
+      ambiguous commit outcomes — a retried admission could consume a
+      second slot; surface the failure instead (the middleware's approved
+      fail-closed policy, D2).
+    - ``messages`` (the R06-A column) is never touched here; both counters
+      compose on the same row orthogonally.
+    - The statement bypasses the ORM identity map — read counters back
+      through a fresh session, as the middleware does.
+
+    ``limit`` must be a positive integer; zero/negative limits are
+    rejected explicitly (``ValueError``) instead of silently admitting.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError(f"admission limit must be an integer >= 1 (got {limit!r})")
+    window_start = as_utc(window_start)
+    dialect = session.get_bind().dialect.name
+    if dialect == "postgresql":
+        insert = pg_insert
+    elif dialect == "sqlite":
+        insert = sqlite_insert
+    else:  # pragma: no cover — defensive: fail loud on unknown backends
+        raise RuntimeError(f"unsupported dialect for atomic request admission: {dialect!r}")
+    statement = (
+        insert(QuotaCounter)
+        .values(
+            agent_id=agent_id,
+            window_start=window_start,
+            requests=1,
+            messages=0,
+            updated_at=utc_now(),
+        )
+        .on_conflict_do_update(
+            index_elements=[QuotaCounter.agent_id, QuotaCounter.window_start],
+            set_={"requests": QuotaCounter.requests + 1, "updated_at": utc_now()},
+            where=QuotaCounter.requests < limit,
+        )
+        .returning(QuotaCounter.requests)
+    )
+    return session.execute(statement).scalar()
+
+
 def persist_request_count(
     session: Session, agent_id: str, window_start: datetime, amount: int = 1
 ) -> None:
     """Mirror an authenticated request count into the QuotaCounter table.
+
+    LEGACY (R06-B F.2 / D3): the production middleware no longer calls
+    this function — the authoritative admission statement
+    (:func:`admit_request`) produces the same durable increment exactly
+    once per admitted request, and running both would double-count. It is
+    retained temporarily for compatibility and for the existing R06-B F.1
+    regression coverage, which asserts the atomicity of this statement
+    directly.
 
     Best-effort durable telemetry (Agent B builds quota decisions on it).
     The caller owns the transaction.
