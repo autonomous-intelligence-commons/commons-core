@@ -24,6 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
+from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
@@ -32,6 +33,19 @@ from commons_core.database.models import QuotaCounter
 from commons_core.infrastructure.time import as_utc, utc_now
 
 _WINDOW_SECONDS = 60
+
+#: Bounded execution for the authoritative admission transaction on
+#: PostgreSQL. ``SET LOCAL`` is transaction-scoped, so the bound applies
+#: only to statements of the admission transaction (the row-lock wait of
+#: the conditional UPSERT under contention and the statement itself) and
+#: can never leak into a later transaction or a pooled connection. The
+#: timeout raises ``QueryCanceled`` on the caller's session, which the
+#: middleware surfaces as the approved fail-closed HTTP 503 (D2) — never
+#: as an admission. SQLite needs no equivalent here: its engine-wide
+#: ``PRAGMA busy_timeout=5000`` (see ``create_engine_for``) already bounds
+#: lock waits, and no PostgreSQL-specific SQL is ever executed against
+#: SQLite (dialect-dispatched below).
+_ADMISSION_STATEMENT_TIMEOUT_SQL = "SET LOCAL statement_timeout = '5s'"
 
 
 @dataclass(slots=True)
@@ -143,6 +157,15 @@ def admit_request(
       both supported backends (PostgreSQL 16 and SQLite >= 3.35), so the
       persisted count never exceeds ``limit`` through successful
       admissions, and a denial never increments the counter.
+    - BOUNDED EXECUTION (PostgreSQL): on the PostgreSQL dialect the call
+      first executes ``SET LOCAL statement_timeout = '5s'`` inside the
+      caller's transaction, so waiting for a contended row lock or a
+      stalled query aborts after ~5 s (``QueryCanceled``) instead of
+      hanging the request indefinitely. Connection establishment is
+      bounded separately at the engine level (``connect_timeout``, see
+      ``create_engine_for``). SQLite relies on its engine-wide
+      ``busy_timeout`` pragma; no PostgreSQL-specific SQL is executed
+      against SQLite.
     - Runs inside the CALLER's transaction: admission and persistence
       share one transaction outcome, and the decision counts as
       successful only once that transaction commits (an admission that
@@ -150,6 +173,14 @@ def admit_request(
       ambiguous commit outcomes — a retried admission could consume a
       second slot; surface the failure instead (the middleware's approved
       fail-closed policy, D2).
+    - Commit outcomes come in exactly three flavors, and a 503 does NOT
+      imply "no slot was consumed": (a) a failure before the commit is
+      durably applied (statement error, timeout, rollback) deterministically
+      consumes nothing; (b) a successful commit is the only admitted case;
+      (c) a commit whose result is unknown because the connection was
+      lost after the server processed it MAY have already consumed the
+      slot — such a 503 is reported without retry and the persisted count
+      (the conservative accounting) stays authoritative.
     - ``messages`` (the R06-A column) is never touched here; both counters
       compose on the same row orthogonally.
     - The statement bypasses the ORM identity map — read counters back
@@ -164,6 +195,11 @@ def admit_request(
     dialect = session.get_bind().dialect.name
     if dialect == "postgresql":
         insert = pg_insert
+        # Bound the admission transaction's execution (lock waits +
+        # statement time). SET LOCAL is scoped to the current transaction
+        # and disappears at COMMIT/ROLLBACK, so pooled connections are
+        # never polluted (regression-tested).
+        session.execute(text(_ADMISSION_STATEMENT_TIMEOUT_SQL))
     elif dialect == "sqlite":
         insert = sqlite_insert
     else:  # pragma: no cover — defensive: fail loud on unknown backends

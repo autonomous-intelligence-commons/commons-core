@@ -995,7 +995,7 @@ class TestFailClosedPolicy:
             _pg_error_factory("LockNotAvailable"),  # lock timeout
             _pg_error_factory("DeadlockDetected"),
             _pg_error_factory("SerializationFailure"),
-            lambda: RuntimeError("ambiguous commit outcome"),
+            lambda: RuntimeError("deterministic pre-commit failure"),
         ],
         ids=[
             "operational-connection",
@@ -1003,12 +1003,21 @@ class TestFailClosedPolicy:
             "lock-timeout",
             "deadlock",
             "serialization",
-            "generic-ambiguous",
+            "generic-pre-commit",
         ],
     )
     def test_admission_failure_classes_are_fail_closed(
         self, limited_client, database, monkeypatch, exc_factory
     ) -> None:
+        """Every admission STATEMENT-stage failure class is fail-closed.
+
+        All six injections fire inside ``admit_request`` — BEFORE any
+        commit — so each deterministically rolls back and consumes no slot
+        (the assertion below). A 503 whose COMMIT outcome is unknown is a
+        DIFFERENT case that MAY have consumed the slot: see
+        ``TestAmbiguousCommitOutcome`` in
+        ``test_r06b_f2_preintegration_review.py``.
+        """
         token = provision_and_login(limited_client, "f2-failclosed-agent")
 
         def _fail(_session, _agent_id, _window, *, limit):
@@ -1028,7 +1037,9 @@ class TestFailClosedPolicy:
         for forbidden in ("psycopg", "select ", "insert ", "postgres", "quota_counters", "bearer"):
             assert forbidden not in body, f"leaked {forbidden!r} in {body!r}"
 
-        # No slot consumed by the failed admission.
+        # Pre-commit statement failure ⇒ deterministic rollback ⇒ no row.
+        # (NOT a general claim about every 503: an ambiguous COMMIT may
+        # have consumed the slot — see TestAmbiguousCommitOutcome.)
         with database.session() as session:
             rows = session.scalars(select(QuotaCounter)).all()
         assert rows == []
@@ -1036,9 +1047,18 @@ class TestFailClosedPolicy:
     def test_recovery_returns_to_authoritative_admission(
         self, limited_client, database, monkeypatch
     ) -> None:
-        """After a transient failure, the next request is admitted through
-        the SAME authoritative statement — and the failed attempt consumed
-        no slot (no double-counting retries)."""
+        """After a PRE-COMMIT failure, the next request is admitted through
+        the SAME authoritative statement — and that failed attempt consumed
+        no slot (no double-counting retries).
+
+        Scope of the claim: the injected failure fires inside
+        ``admit_request`` before any commit, so its rollback is
+        deterministic. A 503 caused by a commit whose result is unknown
+        (connection lost after the server processed COMMIT) MAY have
+        consumed the slot — that case is covered separately by
+        ``TestAmbiguousCommitOutcome`` in
+        ``test_r06b_f2_preintegration_review.py``.
+        """
         token = provision_and_login(limited_client, "f2-recovery-agent")
         state = {"failed": False}
 
@@ -1059,15 +1079,24 @@ class TestFailClosedPolicy:
             counters = list(session.scalars(select(QuotaCounter)))
         assert len(counters) == 1
         assert counters[0].requests == 1, (
-            f"the 503 attempt must not consume a slot (found {counters[0].requests})"
+            f"the pre-commit 503 attempt must not consume a slot (found {counters[0].requests})"
         )
 
     def test_commit_failure_rolls_back_and_fails_closed(
         self, limited_client, database, monkeypatch
     ) -> None:
-        """A COMMIT-stage failure leaves no durable increment (rollback)
-        and is reported as 503 — the decision is successful only after the
-        transaction commits."""
+        """A COMMIT-stage failure that deterministically aborts BEFORE the
+        transaction is durably applied (here: the commit call itself fails
+        client-side, so the server never finalizes it) leaves no durable
+        increment (rollback) and is reported as 503 — the decision is
+        successful only after the transaction commits.
+
+        NOT a general claim about every commit-stage failure: a commit
+        whose result is UNKNOWN because the connection was lost after the
+        server processed it may already have consumed the slot — see
+        ``TestAmbiguousCommitOutcome`` in
+        ``test_r06b_f2_preintegration_review.py``.
+        """
         token = provision_and_login(limited_client, "f2-commitfail-agent")
         state = {"armed": True}
         original_commit = Session.commit

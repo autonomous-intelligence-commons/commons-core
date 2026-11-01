@@ -26,6 +26,20 @@ Admission authority (R06-B F.2 — owner decisions D1/D2/D3):
   different condition and keeps the ordinary HTTP 429 contract below. An
   authentication-infrastructure failure is likewise surfaced as 503, not
   disguised as an invalid-credential 401.
+- Bounded execution (R06-B F.2 pre-integration review): on PostgreSQL the
+  admission transaction runs under ``SET LOCAL statement_timeout`` and
+  every engine connection establishment under libpq ``connect_timeout``
+  (see ``rate_limit.admit_request`` / ``create_engine_for``), so lock
+  contention, a stalled query or a black-holed server fail in bounded
+  time instead of hanging the request.
+- Commit outcomes are reported HONESTLY and never retried: a 503 whose
+  failure predates the commit (statement error, timeout, rollback)
+  deterministically consumed no slot, but a 503 whose COMMIT result is
+  unknown because the connection was lost after the server processed it
+  MAY have already consumed a slot. The middleware makes exactly ONE
+  admission attempt per request — it never automatically retries an
+  ambiguous commit (a retry could consume a second slot); the persisted
+  counter stays the conservative, authoritative accounting.
 - ANONYMOUS requests keep the in-memory per-process limiter (privacy: no
   IP-keyed persistent quota rows) and never depend on the database for
   admission.

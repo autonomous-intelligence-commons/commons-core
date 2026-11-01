@@ -26,9 +26,30 @@ from commons_core.config.settings import get_settings
 from commons_core.database import models  # noqa: F401  (registers all tables on Base)
 from commons_core.database.base import Base
 
+#: Bounded TCP connection establishment for PostgreSQL engines (seconds).
+#: libpq's default is UNBOUNDED: without this, a black-holed server (SYNs
+#: silently dropped — no RST, no ICMP) hangs every pool checkout that needs
+#: a new connection for as long as the OS TCP stack is willing to wait.
+#: This bounds every connection the engine establishes, including the
+#: authoritative admission transaction's (R06-B F.2 pre-integration
+#: review); a timed-out establishment raises ``OperationalError`` on the
+#: caller, which the middleware surfaces as fail-closed HTTP 503 (D2).
+_PG_CONNECT_TIMEOUT_S = 5
+
 
 def create_engine_for(url: str) -> Engine:
-    """Create an engine with dialect-appropriate pooling and SQLite pragmas."""
+    """Create an engine with dialect-appropriate pooling and SQLite pragmas.
+
+    PostgreSQL: bounded connection establishment (``connect_timeout``
+    above) plus ``pool_pre_ping``. SQLite: the pragmas below (the
+    engine-wide ``busy_timeout`` bounds SQLite lock waits — the role
+    ``SET LOCAL statement_timeout`` plays per-transaction on PostgreSQL,
+    see ``rate_limit.admit_request``).
+    """
+    if url.startswith("postgresql"):
+        return create_engine(
+            url, pool_pre_ping=True, connect_args={"connect_timeout": _PG_CONNECT_TIMEOUT_S}
+        )
     if not url.startswith("sqlite"):
         return create_engine(url, pool_pre_ping=True)
 
