@@ -177,7 +177,7 @@ jobs:
 
   postgres:
     name: PostgreSQL 16 integration (migrations + full suite)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # HONEST scope: executes against a REAL PostgreSQL 16 service container.
     # The suite is pointed at PostgreSQL via AIC_TEST_DATABASE_URL and ABORTS
     # (pytest.UsageError) if the server is unreachable or misconfigured —
